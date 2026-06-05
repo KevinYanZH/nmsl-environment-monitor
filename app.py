@@ -1,16 +1,20 @@
 import os
 import re
-from zoneinfo import ZoneInfo
 
-import requests
 import pandas as pd
 import streamlit as st
 import altair as alt
+import requests
 
 try:
     from streamlit_autorefresh import st_autorefresh
 except ImportError:
     st_autorefresh = None
+
+
+BASE_URL = "https://api.sensorpush.com/api/v1"
+DEFAULT_LOCAL_TIMEZONE = "America/Toronto"
+DEFAULT_SAMPLE_LIMIT = 500
 
 # ---------------------------------------------------------------------------
 # Lab limits
@@ -681,7 +685,7 @@ st.markdown(
     }
 
     .graph-legend {
-        margin: 4px 0 12px 46px !important;
+        margin: 4px 0 12px 22px !important;
         gap: 42px !important;
         font-size: 12px !important;
     }
@@ -796,17 +800,8 @@ else:
         """, unsafe_allow_html=True
     )
 
-BASE_URL = "https://api.sensorpush.com/api/v1"
-
-
 def get_secret(name, default=None):
-    """Read credentials from Streamlit Secrets first, then environment variables.
-
-    On Streamlit Cloud, add these in App settings -> Secrets:
-        SENSORPUSH_EMAIL = "..."
-        SENSORPUSH_PASSWORD = "..."
-        LOCAL_TIMEZONE = "America/Toronto"
-    """
+    """Read from Streamlit secrets first, then environment variables."""
     try:
         if name in st.secrets:
             return st.secrets[name]
@@ -820,7 +815,7 @@ def fahrenheit_to_celsius(temp_f):
 
 
 @st.cache_data(ttl=20 * 60, show_spinner=False)
-def get_access_token_cached(email, password):
+def get_access_token(email, password):
     authorize_response = requests.post(
         f"{BASE_URL}/oauth/authorize",
         headers={"accept": "application/json", "Content-Type": "application/json"},
@@ -841,13 +836,8 @@ def get_access_token_cached(email, password):
 
 
 @st.cache_data(ttl=60, show_spinner=False)
-def fetch_sensorpush_data(email, password, local_timezone, sample_limit=500):
-    """Fetch recent SensorPush samples directly from the API.
-
-    This cloud version does not use sensorpush.db or collector.py. It is meant for
-    Streamlit Community Cloud, where local SQLite files are not reliable storage.
-    """
-    access_token = get_access_token_cached(email, password)
+def fetch_sensorpush_payload(email, password, sample_limit):
+    access_token = get_access_token(email, password)
 
     sensors_response = requests.post(
         f"{BASE_URL}/devices/sensors",
@@ -869,23 +859,47 @@ def fetch_sensorpush_data(email, password, local_timezone, sample_limit=500):
             "Authorization": access_token,
             "Content-Type": "application/json",
         },
-        json={"limit": sample_limit},
+        json={"limit": int(sample_limit)},
         timeout=30,
     )
     samples_response.raise_for_status()
     samples = samples_response.json()
 
+    return sensors, samples
+
+
+def load_data():
+    email = get_secret("SENSORPUSH_EMAIL")
+    password = get_secret("SENSORPUSH_PASSWORD")
+    local_timezone = get_secret("LOCAL_TIMEZONE", DEFAULT_LOCAL_TIMEZONE)
+    sample_limit = int(get_secret("SENSORPUSH_SAMPLE_LIMIT", DEFAULT_SAMPLE_LIMIT))
+
+    if not email or not password:
+        st.error("SensorPush credentials are missing.")
+        st.info(
+            "In Streamlit Cloud, open App settings → Secrets and add "
+            'SENSORPUSH_EMAIL, SENSORPUSH_PASSWORD, and LOCAL_TIMEZONE = "America/Toronto".'
+        )
+        st.stop()
+
+    sensors, samples = fetch_sensorpush_payload(email, password, sample_limit)
+    sensor_data = samples.get("sensors", {})
+
     rows = []
-    for sensor_id, readings in samples.get("sensors", {}).items():
+    for sensor_id, readings in sensor_data.items():
+        if not readings:
+            continue
+
         sensor_name = sensors.get(sensor_id, {}).get("name", sensor_id)
-        for reading in readings or []:
+
+        for reading in readings:
             observed_time = reading.get("observed")
             temperature_f = reading.get("temperature")
             humidity = reading.get("humidity")
             pressure = reading.get("barometric_pressure")
             voltage = reading.get("voltage")
 
-            if not observed_time or temperature_f is None or humidity is None:
+            if observed_time is None or temperature_f is None or humidity is None:
                 continue
 
             rows.append({
@@ -896,35 +910,21 @@ def fetch_sensorpush_data(email, password, local_timezone, sample_limit=500):
                 "humidity": float(humidity) if humidity is not None else None,
                 "barometric_pressure_inhg": float(pressure) if pressure is not None else None,
                 "voltage": float(voltage) if voltage is not None else None,
-                "source": "sensorpush_api_direct",
+                "source": "sensorpush_api_cloud",
             })
 
     df = pd.DataFrame(rows)
     if df.empty:
         return df
 
-    tz = ZoneInfo(local_timezone)
-    df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
-    df["timestamp"] = df["timestamp"].dt.tz_convert(tz)
+    df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
+    df = df.dropna(subset=["timestamp"])
+    df["timestamp"] = df["timestamp"].dt.tz_convert(local_timezone)
+    df = df.drop_duplicates(subset=["sensor_id", "timestamp"]).sort_values("timestamp")
+
     df["timestamp_display"] = df["timestamp"].dt.strftime("%m/%d %I:%M %p")
     df["pressure_mb"] = df["barometric_pressure_inhg"] * 33.8639
-    return df.sort_values("timestamp")
-
-
-def load_data():
-    email = get_secret("SENSORPUSH_EMAIL")
-    password = get_secret("SENSORPUSH_PASSWORD")
-    local_timezone = get_secret("LOCAL_TIMEZONE", "America/Toronto")
-
-    if not email or not password:
-        st.error("SensorPush credentials are missing.")
-        st.info(
-            "On Streamlit Cloud, add SENSORPUSH_EMAIL and SENSORPUSH_PASSWORD in "
-            "App settings → Secrets. Also add LOCAL_TIMEZONE = \"America/Toronto\"."
-        )
-        st.stop()
-
-    return fetch_sensorpush_data(email, password, local_timezone)
+    return df
 
 def is_normal(temp, humidity):
     return (TEMP_MIN <= temp <= TEMP_MAX) and (HUMIDITY_MIN <= humidity <= HUMIDITY_MAX)
@@ -1169,43 +1169,69 @@ def graph_axis_format(range_label):
         return "%m/%d", 6
     return "%b %Y", 6
 
-def make_sensorpush_chart(view, metric_col, title, unit_suffix="", height=160, range_label="D", x_start=None, x_end=None, capture_param=None, union_filter=None, show_x_axis=True, y_domain_override=None):
+def make_sensorpush_chart(view, metric_col, title, unit_suffix="", height=160, range_label="D", x_start=None, x_end=None, capture_param=None, union_filter=None, show_x_axis=True, y_domain_override=None, label_metric_col=None, display_title=True):
     if view.empty:
         return None
 
     view = view.copy()
 
     # Build a SensorPush-style hover label for every visible row.
-    # Keep the wording compact: "06/03 1:32 pm, 23.3°C".
+    # metric_col is what gets plotted. label_metric_col is what gets displayed.
+    # For pressure, this lets us draw a smoothed/hidden-precision-style line while
+    # still showing the real rounded API reading in labels.
+    if label_metric_col is None:
+        label_metric_col = metric_col
+
     time_text = view["timestamp"].dt.strftime("%m/%d %I:%M %p").str.replace(" 0", " ", regex=False).str.lower()
     if unit_suffix == "in":
-        value_text = view[metric_col].map(lambda v: f"{v:.2f}{unit_suffix}")
+        value_text = view[label_metric_col].map(lambda v: f"{v:.2f}{unit_suffix}")
     else:
-        value_text = view[metric_col].map(lambda v: f"{v:.1f}{unit_suffix}")
+        value_text = view[label_metric_col].map(lambda v: f"{v:.1f}{unit_suffix}")
     view["_hover_label"] = time_text + ", " + value_text
 
+    # Fixed chart height, dynamic y-scale from the currently visible data.
+    # The plotted data should use almost the full gray graph area while still leaving
+    # a small amount of headroom and footroom. Do NOT force a large minimum span for
+    # pressure here; otherwise small real changes look too flat and fail to fill the chart.
     if y_domain_override is not None:
-        # Keep the vertical scale stable when sensors are turned on/off.
-        # The caller passes a domain based on the full current time window, not just
-        # the currently selected sensors.
         y_domain = y_domain_override
     else:
         y_min = float(view[metric_col].min())
         y_max = float(view[metric_col].max())
-        y_span = y_max - y_min
-        if y_span <= 0:
-            # Give a flat line a small visible window, but do not over-pad changing data.
-            padding = max(abs(y_max) * 0.002, 0.05)
+        raw_span = y_max - y_min
+
+        if raw_span <= 0:
+            # A perfectly flat series has no vertical range to scale. Use a small window
+            # around the value so the line stays visible and centered.
+            if title == "BAROMETRIC PRESSURE":
+                base_window = 0.12 if unit_suffix == "in" else 0.35
+            elif title == "RELATIVE HUMIDITY":
+                base_window = 0.40
+            else:
+                base_window = 0.30
+            y_mid = (y_min + y_max) / 2
+            y_domain = [y_mid - base_window / 2, y_mid + base_window / 2]
         else:
-            # Tight local scale, used only when no external stable domain is supplied.
-            padding = max(y_span * 0.08, 0.03)
+            # 18% padding means the data occupies about 73% of the graph height:
+            # enough to clearly fill the chart, but not so tight that it touches edges.
+            padding = raw_span * 0.18
+            y_domain = [y_min - padding, y_max + padding]
 
-        y_domain = [y_min - padding, y_max + padding]
     axis_format, tick_count = graph_axis_format(range_label)
-    x_scale = alt.Scale(domain=[x_start, x_end]) if x_start is not None and x_end is not None else alt.Scale()
 
-    # Only the bottom chart shows time labels (clean line + a few ticks). The upper charts
-    # share the same x-range but hide their axis so the column reads like the official site.
+    # IMPORTANT: create a real left-side time gutter inside the same Altair chart.
+    # The visible data domain begins at x_start, but the chart's scale begins earlier.
+    # The gray rectangle, dotted mean line, and data all start at x_start, leaving a
+    # white gutter for the mean label to the left. This avoids hconcat/Streamlit sizing
+    # issues where the gutter can be ignored.
+    if x_start is not None and x_end is not None:
+        x_span = x_end - x_start
+        gutter_start = x_start - (x_span * 0.075)
+        x_scale = alt.Scale(domain=[gutter_start, x_end])
+    else:
+        gutter_start = view["timestamp"].min()
+        x_scale = alt.Scale()
+
     if show_x_axis:
         x_axis = alt.Axis(
             format=axis_format,
@@ -1222,89 +1248,138 @@ def make_sensorpush_chart(view, metric_col, title, unit_suffix="", height=160, r
     else:
         x_axis = alt.Axis(labels=False, ticks=False, domain=False, grid=False, title=None)
 
+    y_axis_hidden = alt.Axis(labels=False, ticks=False, domain=False, grid=False)
+    y_scale = alt.Scale(domain=y_domain, zero=False)
+    color_scale = alt.Scale(range=["#52b83f", "#4267bd", "#35a6b9", "#ff9f1c", "#8e44ad"])
+
     plot_bg = alt.Chart(pd.DataFrame({"x": [x_start], "x2": [x_end], "y": [y_domain[0]], "y2": [y_domain[1]]})).mark_rect(
         color="#e7e8ee"
     ).encode(
         x=alt.X("x:T", scale=x_scale, axis=x_axis),
         x2="x2:T",
-        y=alt.Y("y:Q", scale=alt.Scale(domain=y_domain, zero=False), axis=alt.Axis(labels=False, ticks=False, domain=False, grid=False), title=None),
+        y=alt.Y("y:Q", scale=y_scale, axis=y_axis_hidden, title=None),
         y2="y2:Q",
     )
 
-    color_scale = alt.Scale(range=["#52b83f", "#4267bd", "#35a6b9", "#ff9f1c", "#8e44ad"])
-
     line = alt.Chart(view).mark_line(strokeWidth=1.8, clip=True).encode(
         x=alt.X("timestamp:T", title=None, scale=x_scale, axis=x_axis),
-        y=alt.Y(
-            f"{metric_col}:Q",
-            title=None,
-            scale=alt.Scale(domain=y_domain, zero=False),
-            axis=alt.Axis(labels=False, ticks=False, domain=False, grid=False),
-        ),
+        y=alt.Y(f"{metric_col}:Q", title=None, scale=y_scale, axis=y_axis_hidden),
         color=alt.Color("sensor_name:N", title=None, scale=color_scale, legend=None),
     )
 
-    mean_value = float(view[metric_col].mean())
-    mean_line = alt.Chart(pd.DataFrame({"y": [mean_value]})).mark_rule(
+    mean_value = float(view[label_metric_col].mean())
+    mean_line = alt.Chart(pd.DataFrame({"x": [x_start], "x2": [x_end], "y": [mean_value]})).mark_rule(
         strokeDash=[2, 5], strokeWidth=2, color="#aeb4c6"
-    ).encode(y="y:Q")
+    ).encode(
+        x=alt.X("x:T", scale=x_scale),
+        x2="x2:T",
+        y=alt.Y("y:Q", scale=y_scale),
+    )
 
-    label_x = x_start if x_start is not None else view["timestamp"].min()
     label_text = f"{mean_value:.1f}{unit_suffix}"
-    label = alt.Chart(pd.DataFrame({"x": [label_x], "y": [mean_value], "label": [label_text]})).mark_text(
-        align="left", baseline="middle", dx=8, fontSize=11, color="#30355e"
-    ).encode(x="x:T", y="y:Q", text="label:N")
+    label = alt.Chart(pd.DataFrame({"x": [x_start], "y": [mean_value], "label": [label_text]})).mark_text(
+        align="right", baseline="middle", dx=-10, fontSize=11, color="#30355e", clip=False
+    ).encode(
+        x=alt.X("x:T", scale=x_scale),
+        y=alt.Y("y:Q", scale=y_scale),
+        text="label:N",
+    )
 
-    # Hover interaction: vertical crosshair + highlighted dots + SensorPush-style labels.
-    # Each chart gets its OWN capture param (so every plot responds to the pointer). The
-    # selection stores the hovered TIMESTAMP; all visual layers then match every sensor row
-    # whose timestamp equals that value, so the crosshair + a label for EACH sensor appear
-    # on all three charts at once (like the official site).
+    # Smooth hover: SensorPush Cloud moves the marker continuously along the drawn
+    # line instead of jumping only at recorded sample timestamps. Vega-Lite selections
+    # normally snap to real data rows, so create a dense, interpolated hover-only table.
+    # The visible line still uses the real recorded samples; the hover dots/labels use
+    # linear interpolation between those samples so the popup follows the line smoothly.
+    # Lightweight smooth hover. The previous version used very dense hover anchors
+    # such as 5 seconds for H and 30 seconds for D, which made Vega/Altair laggy
+    # because every chart had to render many invisible selector points and labels.
+    # These intervals keep the hover visually smooth, but reduce the number of
+    # generated hover rows enough for Streamlit to stay responsive.
+    hover_freq = hover_freq_for_range(range_label)
+
+    if x_start is not None and x_end is not None:
+        hover_index = pd.date_range(start=x_start, end=x_end, freq=hover_freq)
+        if len(hover_index) == 0:
+            hover_index = pd.DatetimeIndex(sorted(view["timestamp"].dropna().unique()))
+    else:
+        hover_index = pd.DatetimeIndex(sorted(view["timestamp"].dropna().unique()))
+
+    anchor_times = pd.DataFrame({"_hover_anchor": hover_index})
+
+    hover_parts = []
+    numeric_cols = [metric_col]
+    if label_metric_col != metric_col:
+        numeric_cols.append(label_metric_col)
+
+    for sensor_name, sensor_rows in view.sort_values("timestamp").groupby("sensor_name", sort=False):
+        sensor_numeric = (
+            sensor_rows.set_index("timestamp")[numeric_cols]
+            .groupby(level=0).mean()
+            .sort_index()
+        )
+
+        # Reindex to both actual reading times and dense hover times, then interpolate
+        # based on time. Reindex back to hover times only so every sensor has a value at
+        # the same smoothly moving anchor positions. Edge NaNs are dropped below so the
+        # hover does not invent data before the first reading or after the last reading.
+        combined_index = sensor_numeric.index.union(hover_index).sort_values()
+        interpolated = (
+            sensor_numeric.reindex(combined_index)
+            .interpolate(method="time")
+            .reindex(hover_index)
+        )
+        interpolated["sensor_name"] = sensor_name
+        interpolated["_hover_anchor"] = interpolated.index
+        hover_parts.append(interpolated.reset_index(drop=True))
+
+    hover_view = pd.concat(hover_parts, ignore_index=True) if hover_parts else view.copy()
+    hover_view = hover_view.dropna(subset=[metric_col, "sensor_name", "_hover_anchor"])
+
+    anchor_time_text = hover_view["_hover_anchor"].dt.strftime("%m/%d %I:%M %p").str.replace(" 0", " ", regex=False).str.lower()
+    if unit_suffix == "in":
+        anchor_value_text = hover_view[label_metric_col].map(lambda v: f"{v:.2f}{unit_suffix}")
+    else:
+        anchor_value_text = hover_view[label_metric_col].map(lambda v: f"{v:.1f}{unit_suffix}")
+    hover_view["_hover_label"] = anchor_time_text + ", " + anchor_value_text
+
     if capture_param is None:
         capture_param = alt.selection_point(
             name="sp_hover_0", nearest=True, on="pointerover",
-            fields=["timestamp"], empty=False, clear="pointerout",
+            fields=["_hover_anchor"], empty=False, clear="pointerout",
         )
     if union_filter is None:
-        # Match any datum whose timestamp equals the selected timestamp from this chart.
         union_filter = (
             f'(length(data("{capture_param.name}_store")) > 0) && '
-            f'(toNumber(datum.timestamp) == toNumber(data("{capture_param.name}_store")[0].values[0]))'
+            f'(toNumber(datum._hover_anchor) == toNumber(data("{capture_param.name}_store")[0].values[0]))'
         )
 
-    # Invisible selectors capture the pointer for THIS chart. They are built on a set of
-    # UNIQUE timestamps (one row per time), so the nearest-point selection locks onto a
-    # timestamp rather than snapping between individual sensor points (which caused the
-    # hover to cycle through sensors one at a time). The union filter below then expands
-    # that single timestamp to a label for every sensor at that time.
-    unique_times = pd.DataFrame({"timestamp": pd.Series(view["timestamp"].unique())})
-    selectors = alt.Chart(unique_times).mark_point(opacity=0, size=160).encode(
-        x=alt.X("timestamp:T", scale=x_scale),
+    selectors = alt.Chart(anchor_times).mark_point(opacity=0, size=180).encode(
+        x=alt.X("_hover_anchor:T", scale=x_scale),
         tooltip=alt.value(None),
     ).add_params(capture_param)
 
-    points = line.mark_point(filled=True, size=85, clip=True).encode(
+    points = alt.Chart(hover_view).mark_point(filled=True, size=85, clip=True).encode(
+        x=alt.X("_hover_anchor:T", scale=x_scale),
+        y=alt.Y(f"{metric_col}:Q", title=None, scale=y_scale, axis=y_axis_hidden),
+        color=alt.Color("sensor_name:N", title=None, scale=color_scale, legend=None),
         opacity=alt.condition(union_filter, alt.value(1), alt.value(0)),
         tooltip=alt.value(None),
     )
 
-    rule = alt.Chart(view).mark_rule(color="#060b3f", strokeDash=[2, 3], strokeWidth=1, opacity=0.9, clip=True).encode(
-        x=alt.X("timestamp:T", scale=x_scale),
+    rule = alt.Chart(anchor_times).mark_rule(color="#060b3f", strokeDash=[2, 3], strokeWidth=1, opacity=0.9, clip=True).encode(
+        x=alt.X("_hover_anchor:T", scale=x_scale),
         tooltip=alt.value(None),
     ).transform_filter(union_filter)
 
-    # Edge-aware flip. The pill is ~158px wide; flip to the LEFT of the crosshair once the
-    # selected timestamp is far enough right that a right-side pill would clip the border.
     x_start_ms = pd.Timestamp(x_start).value // 10**6 if x_start is not None else int(view["timestamp"].min().value // 10**6)
     x_end_ms = pd.Timestamp(x_end).value // 10**6 if x_end is not None else int(view["timestamp"].max().value // 10**6)
     span_ms = max(x_end_ms - x_start_ms, 1)
-    flip_expr = f"(toNumber(datum.timestamp) - {x_start_ms}) / {span_ms} > 0.55"
+    flip_expr = f"(toNumber(datum._hover_anchor) - {x_start_ms}) / {span_ms} > 0.55"
 
-    yq = alt.Y(f"{metric_col}:Q", scale=alt.Scale(domain=y_domain, zero=False))
-    xt = alt.X("timestamp:T", scale=x_scale)
+    yq = alt.Y(f"{metric_col}:Q", scale=y_scale)
+    xt = alt.X("_hover_anchor:T", scale=x_scale)
     col = alt.Color("sensor_name:N", title=None, scale=color_scale, legend=None)
-
-    hover_base = alt.Chart(view).transform_filter(union_filter).transform_calculate(_flip=flip_expr)
+    hover_base = alt.Chart(hover_view).transform_filter(union_filter).transform_calculate(_flip=flip_expr)
 
     PILL_W = 158
     PILL_H = 20
@@ -1322,36 +1397,134 @@ def make_sensorpush_chart(view, metric_col, title, unit_suffix="", height=160, r
         align="right", baseline="middle", dx=-16, fontSize=11, color="#ffffff", clip=True,
     ).encode(x=xt, y=yq, text="_hover_label:N", tooltip=alt.value(None))
 
-    chart_title = alt.TitleParams(
-        text=title,
-        anchor="start",
-        align="left",
-        dx=0,
-        fontSize=12,
-        fontWeight="bold",
-        color="#060b3f",
-        offset=6,
-    )
-
-    # clip is applied at the concat level (configure_* is illegal on a concat subchart).
-    return alt.layer(
+    layered = alt.layer(
         plot_bg, mean_line, line, label, selectors, rule, points,
         bg_right, text_right, bg_left, text_left
     ).properties(
         height=height,
         width="container",
-        title=chart_title,
     )
+
+    if display_title:
+        chart_title = alt.TitleParams(
+            text=title,
+            anchor="start",
+            align="left",
+            dx=22,
+            fontSize=12,
+            fontWeight="bold",
+            color="#060b3f",
+            offset=6,
+        )
+        layered = layered.properties(title=chart_title)
+
+    return layered
+
+
+def hover_freq_for_range(range_label):
+    if range_label == "H":
+        return "15s"
+    if range_label == "D":
+        return "2min"
+    if range_label == "W":
+        return "20min"
+    if range_label == "M":
+        return "2h"
+    return "1D"
+
+
+def make_title_hover_band(title, range_label="D", x_start=None, x_end=None, capture_param=None, band_height=28):
+    """Draw a section-title row that also captures hover across the entire gap.
+
+    The earlier versions used invisible points. That only catches the mouse near
+    those points, so the white rows between charts can feel dead. This version
+    builds transparent rectangular cells that cover the whole title/gap band from
+    left to right, including the title text area.
+    """
+    if x_start is not None and x_end is not None:
+        x_span = x_end - x_start
+        gutter_start = x_start - (x_span * 0.075)
+        x_scale = alt.Scale(domain=[gutter_start, x_end])
+        hover_index = pd.date_range(start=x_start, end=x_end, freq=hover_freq_for_range(range_label))
+        if len(hover_index) == 0:
+            hover_index = pd.DatetimeIndex([x_start, x_end])
+        # Make sure the row has endpoints so rectangular hit areas cover everything.
+        hover_index = hover_index.union(pd.DatetimeIndex([x_start, x_end])).sort_values()
+    else:
+        now = pd.Timestamp.now()
+        x_start = now
+        x_end = now + pd.Timedelta(minutes=1)
+        gutter_start = now
+        x_scale = alt.Scale()
+        hover_index = pd.DatetimeIndex([x_start, x_end])
+
+    if capture_param is None:
+        capture_param = alt.selection_point(
+            name="sp_hover_title", nearest=True, on="pointerover",
+            fields=["_hover_anchor"], empty=False, clear="pointerout",
+        )
+
+    # Build full-height transparent hover rectangles. Each rectangle maps to one
+    # hover anchor time; moving horizontally across the title/gap row updates the
+    # same shared hover selection used by the charts.
+    anchors = list(pd.DatetimeIndex(hover_index))
+    rows = []
+    for i, anchor in enumerate(anchors):
+        if i == 0:
+            x0 = gutter_start
+        else:
+            x0 = anchors[i - 1] + (anchor - anchors[i - 1]) / 2
+        if i == len(anchors) - 1:
+            x1 = x_end
+        else:
+            x1 = anchor + (anchors[i + 1] - anchor) / 2
+        # Keep all intervals within the visual chart domain.
+        if x0 < gutter_start:
+            x0 = gutter_start
+        if x1 > x_end:
+            x1 = x_end
+        rows.append({"x0": x0, "x1": x1, "y0": 0, "y1": 1, "_hover_anchor": anchor})
+
+    hit_df = pd.DataFrame(rows)
+
+    title_df = pd.DataFrame({
+        "x": [gutter_start],
+        "y": [0.5],
+        "label": [title],
+    })
+
+    title_mark = alt.Chart(title_df).mark_text(
+        align="left", baseline="middle", dx=22,
+        fontSize=12, fontWeight="bold", color="#060b3f"
+    ).encode(
+        x=alt.X("x:T", scale=x_scale, axis=alt.Axis(labels=False, ticks=False, domain=False, grid=False, title=None)),
+        y=alt.Y("y:Q", scale=alt.Scale(domain=[0, 1]), axis=alt.Axis(labels=False, ticks=False, domain=False, grid=False, title=None)),
+        text="label:N",
+        tooltip=alt.value(None),
+    )
+
+    # opacity is tiny but non-zero so Vega receives pointer events reliably.
+    hover_rects = alt.Chart(hit_df).mark_rect(color="#ffffff", opacity=0.001).encode(
+        x=alt.X("x0:T", scale=x_scale, axis=alt.Axis(labels=False, ticks=False, domain=False, grid=False, title=None)),
+        x2="x1:T",
+        y=alt.Y("y0:Q", scale=alt.Scale(domain=[0, 1]), axis=alt.Axis(labels=False, ticks=False, domain=False, grid=False, title=None)),
+        y2="y1:Q",
+        tooltip=alt.value(None),
+    ).add_params(capture_param)
+
+    # Put the hit rectangles on top of the text, so even hovering directly over
+    # the words triggers the same hover behavior as the blank gap area.
+    return alt.layer(title_mark, hover_rects).properties(height=band_height, width="container")
 
 try:
     df = load_data()
 except Exception as e:
-    st.error("Could not load SensorPush API data.")
+    st.error("Could not load SensorPush data.")
     st.exception(e)
     st.stop()
 
 if df.empty:
-    st.warning("No readings returned from SensorPush yet. Try refreshing in a minute.")
+    st.warning("No SensorPush readings were returned. Check the SensorPush account, sensors, gateway connection, and sample limit.")
     st.stop()
 
 newest = df.iloc[-1]
@@ -1627,63 +1800,55 @@ else:
                 pressure_view["pressure_display"] = pressure_view["pressure_mb"]
                 pressure_suffix = "mb"
 
+            # SensorPush Cloud appears to draw pressure from higher precision than the
+            # one-decimal label it displays. The public API often returns pressure rounded
+            # to 0.01 inHg, which is about 0.34 mb. Drawing those rounded values directly
+            # makes the pressure graph look stepped/spiky. This smoothed plot column keeps
+            # the displayed readings unchanged, but draws pressure more like the official
+            # graph by reducing quantization artifacts.
+            pressure_view = pressure_view.sort_values(["sensor_name", "timestamp"])
+            pressure_view["pressure_display_plot"] = (
+                pressure_view.groupby("sensor_name", group_keys=False)["pressure_display"]
+                .apply(lambda s: s.ewm(span=5, adjust=False, min_periods=1).mean())
+            )
+
             # Each chart captures the pointer with its own param storing the hovered timestamp.
             # The filter matches EVERY sensor row whose timestamp equals the hovered timestamp
             # from ANY chart, so hovering one plot shows all sensors' values on all three.
             hover_params = [
                 alt.selection_point(
                     name=f"sp_hover_{i}", nearest=True, on="pointerover",
-                    fields=["timestamp"], empty=False, clear="pointerout",
+                    fields=["_hover_anchor"], empty=False, clear="pointerout",
                 )
-                for i in range(3)
+                for i in range(6)
             ]
             union_filter = " || ".join(
                 f'((length(data("{p.name}_store")) > 0) && '
-                f'(toNumber(datum.timestamp) == toNumber(data("{p.name}_store")[0].values[0])))'
+                f'(toNumber(datum._hover_anchor) == toNumber(data("{p.name}_store")[0].values[0])))'
                 for p in hover_params
             )
 
-            # Build vertical domains from ALL sensors in the current time window. This keeps
-            # each graph's height/scale from jumping or shrinking when individual sensors are
-            # selected/deselected. The domain still updates when the time range changes.
-            full_window = df[(df["timestamp"] >= graph_start) & (df["timestamp"] <= graph_end)].copy()
+            # Fixed chart height, dynamic y-scale from the currently visible sensors.
+            # This keeps the gray graph boxes the same size while letting the actual lines
+            # expand vertically instead of looking flat.
+            temp_title = make_title_hover_band("TEMPERATURE", range_label=range_label, x_start=graph_start, x_end=graph_end, capture_param=hover_params[3], band_height=28)
+            humidity_title = make_title_hover_band("RELATIVE HUMIDITY", range_label=range_label, x_start=graph_start, x_end=graph_end, capture_param=hover_params[4], band_height=28)
+            pressure_title = make_title_hover_band("BAROMETRIC PRESSURE", range_label=range_label, x_start=graph_start, x_end=graph_end, capture_param=hover_params[5], band_height=28)
 
-            def stable_y_domain(domain_df, column):
-                if domain_df.empty or domain_df[column].dropna().empty:
-                    return None
-                y_min = float(domain_df[column].min())
-                y_max = float(domain_df[column].max())
-                y_span = y_max - y_min
-                if y_span <= 0:
-                    padding = max(abs(y_max) * 0.002, 0.05)
-                else:
-                    padding = max(y_span * 0.08, 0.03)
-                return [y_min - padding, y_max + padding]
-
-            temp_domain_view = full_window.copy()
-            if temp_unit == "°F":
-                temp_domain_view["temperature_display"] = temp_domain_view["temperature_c"] * 9 / 5 + 32
-            else:
-                temp_domain_view["temperature_display"] = temp_domain_view["temperature_c"]
-
-            pressure_domain_view = full_window.copy()
-            if pressure_unit == "in":
-                pressure_domain_view["pressure_display"] = pressure_domain_view["pressure_mb"] / 33.8639
-            else:
-                pressure_domain_view["pressure_display"] = pressure_domain_view["pressure_mb"]
-
-            temp_y_domain = stable_y_domain(temp_domain_view, "temperature_display")
-            humidity_y_domain = stable_y_domain(full_window, "humidity")
-            pressure_y_domain = stable_y_domain(pressure_domain_view, "pressure_display")
-
-            temp_chart = make_sensorpush_chart(temp_view, "temperature_display", "TEMPERATURE", temp_suffix, height=155, range_label=range_label, x_start=graph_start, x_end=graph_end, capture_param=hover_params[0], union_filter=union_filter, show_x_axis=False, y_domain_override=temp_y_domain)
-            humidity_chart = make_sensorpush_chart(view, "humidity", "RELATIVE HUMIDITY", "%", height=155, range_label=range_label, x_start=graph_start, x_end=graph_end, capture_param=hover_params[1], union_filter=union_filter, show_x_axis=False, y_domain_override=humidity_y_domain)
-            pressure_chart = make_sensorpush_chart(pressure_view, "pressure_display", "BAROMETRIC PRESSURE", pressure_suffix, height=155, range_label=range_label, x_start=graph_start, x_end=graph_end, capture_param=hover_params[2], union_filter=union_filter, show_x_axis=True, y_domain_override=pressure_y_domain)
+            temp_chart = make_sensorpush_chart(temp_view, "temperature_display", "TEMPERATURE", temp_suffix, height=155, range_label=range_label, x_start=graph_start, x_end=graph_end, capture_param=hover_params[0], union_filter=union_filter, show_x_axis=False, display_title=False)
+            humidity_chart = make_sensorpush_chart(view, "humidity", "RELATIVE HUMIDITY", "%", height=155, range_label=range_label, x_start=graph_start, x_end=graph_end, capture_param=hover_params[1], union_filter=union_filter, show_x_axis=False, display_title=False)
+            pressure_chart = make_sensorpush_chart(pressure_view, "pressure_display_plot", "BAROMETRIC PRESSURE", pressure_suffix, height=155, range_label=range_label, x_start=graph_start, x_end=graph_end, capture_param=hover_params[2], union_filter=union_filter, show_x_axis=True, label_metric_col="pressure_display", display_title=False)
 
             combined_chart = alt.vconcat(
-                temp_chart, humidity_chart, pressure_chart, spacing=8,
+                temp_title, temp_chart,
+                humidity_title, humidity_chart,
+                pressure_title, pressure_chart,
+                spacing=0,
             ).resolve_scale(x="shared", color="shared").properties(
-                padding={"left": 46, "right": 4, "top": 4, "bottom": 0},
+                # The mean-label gutter is handled by the x-scale domain inside
+                # make_sensorpush_chart; keep outer padding small to avoid shifting
+                # the whole chart column.
+                padding={"left": 4, "right": 4, "top": 4, "bottom": 0},
                 background="transparent",
                 autosize={"type": "fit-x", "contains": "padding"},
             ).configure_view(strokeWidth=0).configure_mark(tooltip=None)

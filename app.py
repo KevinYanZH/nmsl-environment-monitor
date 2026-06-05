@@ -1,0 +1,1691 @@
+import os
+import re
+from zoneinfo import ZoneInfo
+
+import requests
+import pandas as pd
+import streamlit as st
+import altair as alt
+
+try:
+    from streamlit_autorefresh import st_autorefresh
+except ImportError:
+    st_autorefresh = None
+
+# ---------------------------------------------------------------------------
+# Lab limits
+# ---------------------------------------------------------------------------
+TEMP_MIN, TEMP_MAX = 18.0, 28.0
+HUMIDITY_MIN, HUMIDITY_MAX = 20.0, 60.0
+
+TEMP_SCALE = (15.0, 30.0)
+HUMIDITY_SCALE = (10.0, 70.0)
+PRESSURE_SCALE = (960.0, 1000.0)
+
+st.set_page_config(page_title="SensorPush Style Dashboard", layout="wide")
+
+# CSS styling to imitate SensorPush Cloud page
+st.markdown(
+    """
+    <style>
+    .stApp { background-color: #ffffff; color: #060b3f; }
+
+    /* Increased left and right padding to give more spacing on the edges */
+    .block-container {
+        padding-top: 0rem; padding-left: 2.5rem;
+        padding-right: 2.5rem; padding-bottom: 0rem; max-width: 100%;
+    }
+
+    .top-bar {
+        display: flex; justify-content: space-between; align-items: center;
+        border-bottom: 1px solid #bfc2cc; padding: 4px 4px 8px 4px; margin-bottom: 0px;
+    }
+    .logo-text { font-size: 24px; font-weight: 700; font-style: italic; color: #060b3f; white-space: nowrap; }
+    .logo-icon {
+        display: inline-block; width: 26px; height: 26px;
+        background-color: #52b83f; border-radius: 50%; margin-right: 12px;
+    }
+
+    .header-divider {
+        border-bottom: 1px solid #bfc2cc;
+        margin-top: 2px;
+        margin-bottom: 0px;
+    }
+
+    .utility-row {
+        display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px;
+    }
+    .legend { display: flex; gap: 24px; align-items: center; font-size: 12px; color: #252b5a; margin-top: 0px; min-height:34px; }
+    .legend-item { display: flex; align-items: center; gap: 8px; }
+    .legend-box-green { width: 24px; height: 24px; background-color: #52b83f; border-radius: 5px; }
+    .legend-box-red { width: 24px; height: 24px; background-color: #ff4438; border-radius: 5px; }
+    .legend-box-gray { width: 24px; height: 24px; background-color: #c6c8cf; border-radius: 5px; }
+
+    .section-title {
+        font-size: 22px; font-weight: 700; color: #060b3f;
+        margin-top: 0px; margin-bottom: 8px;
+    }
+    
+    /* Make Streamlit text input look exactly like the filter box */
+    div[data-testid="stTextInput"] { width: 250px; margin-bottom: 8px; }
+    div[data-testid="stTextInput"] input {
+        background-color: #ffffff !important;
+        border: 1px solid #e2e2e5 !important; border-radius: 5px !important; color: #060b3f !important;
+        padding: 9px 16px !important; font-size: 15px !important;
+    }
+    div[data-testid="stTextInput"] input::placeholder { color: #9a9aa0 !important; }
+
+    .gateway-card {
+        border: 1px solid #e2e2e5; border-radius: 8px; padding: 14px 18px;
+        width: 500px; margin-bottom: 4px; display: flex; align-items: center; gap: 15px;
+    }
+    .gateway-icon { width: 30px; height: 30px; background-color: #52b83f; border-radius: 7px; }
+    .gateway-name { font-size: 16px; font-weight: 700; color: #060b3f; }
+    .gateway-time { font-size: 11px; color: #20285c; }
+
+    .sensor-card {
+        border: 1px solid #e2e2e5; border-radius: 8px; padding: 14px 18px;
+        min-height: 300px; background-color: #ffffff;
+    }
+    .sensor-card-header {
+        display: flex; justify-content: space-between; align-items: flex-start;
+        border-bottom: 1px solid #e2e2e5; padding-bottom: 12px; margin-bottom: 4px;
+    }
+    .sensor-left-header { display: flex; gap: 14px; align-items: flex-start; }
+    .sensor-square { width: 44px; height: 44px; border-radius: 9px; background-color: #52b83f; }
+    .sensor-square-red { width: 44px; height: 44px; border-radius: 9px; background-color: #ff4438; }
+    .sensor-name { font-size: 19px; font-weight: 700; color: #060b3f; }
+    .sensor-time { font-size: 12px; color: #20285c; margin-top: -5px; }
+    .battery-row { display: flex; align-items: center; gap: 6px; justify-content: flex-end; color: #20285c; font-size: 13px; }
+    .signal-bars { display: inline-flex; align-items: flex-end; gap: 2px; height: 14px; }
+    .signal-bars span { width: 3px; background-color: #060b3f; border-radius: 1px; }
+    .signal-bars span:nth-child(1) { height: 5px; }
+    .signal-bars span:nth-child(2) { height: 8px; }
+    .signal-bars span:nth-child(3) { height: 11px; }
+    .signal-bars span:nth-child(4) { height: 14px; }
+    .sensor-type { color: #20285c; font-size: 12px; text-align: right; margin-top: 4px; }
+    .battery-row > span:first-of-type { display: inline-block; transform: translateY(2px); }
+
+    .metric-row { display: grid; grid-template-columns: 1fr 1.15fr; align-items: center; margin: 12px 0; gap: 18px; }
+    .metric-label { font-size: 11px; color: #20285c; font-weight: 600; letter-spacing: 0.4px; }
+    .metric-value { font-size: 40px; color: #30355e; font-weight: 300; line-height: 0.95; }
+
+    .bar-track { height: 40px; background-color: #e7e8ee; position: relative; overflow: hidden; }
+    .bar-line { position: absolute; top: 19px; left: 0; right: 0; height: 2px; background-color: #060b3f; }
+    .bar-dot { position: absolute; top: 14px; width: 12px; height: 12px; background-color: #060b3f; border-radius: 50%; }
+    .bar-dot-red { position: absolute; top: 14px; width: 12px; height: 12px; background-color: #ff4438; border-radius: 50%; }
+    .hatched {
+        background: repeating-linear-gradient(-45deg, #e7e8ee, #e7e8ee 4px, #cdd0da 4px, #cdd0da 6px);
+    }
+
+    /* Navigation tabs - scoped only to the STATUS / GRAPH radio */
+    .st-key-main_nav {
+        height: 34px !important;
+        min-height: 34px !important;
+        display: flex !important;
+        align-items: center !important;
+        margin: 0 !important;
+    }
+    .st-key-main_nav div[role="radiogroup"] { 
+        gap: 10px !important;
+        padding: 0px 4px !important;
+        margin: 0px !important;
+        align-items: center !important;
+        justify-content: flex-start !important;
+        min-height: 34px !important;
+        height: 34px !important;
+        display: flex !important;
+    }
+    .st-key-main_nav div[role="radiogroup"] label > div:first-child { display: none !important; }
+    .st-key-main_nav div[role="radiogroup"] label {
+        cursor: pointer;
+        opacity: 1 !important;
+        display: flex !important;
+        align-items: center !important;
+        justify-content: center !important;
+        height: 34px !important;
+        margin: 0 !important;
+    }
+    .st-key-main_nav div[role="radiogroup"] label p {
+        font-weight: 700 !important;
+        font-size: 11px !important;
+        letter-spacing: 0.5px;
+        color: #060b3f !important;
+        margin: 0 !important;
+        padding: 0px 16px !important;
+        border-radius: 14px !important;
+        height: 24px !important;
+        min-width: 72px !important;
+        display: flex !important;
+        align-items: center !important;
+        justify-content: center !important;
+        line-height: 24px !important;
+    }
+    .st-key-main_nav div[role="radiogroup"] label:has(input:checked) p {
+        background-color: #e5e5e8 !important;
+    }
+
+    div.stDownloadButton { margin-top: 0px !important; margin-bottom: 0px !important; display:flex !important; align-items:center !important; min-height:34px !important; }
+    /* Fine-tune ↓ EXPORT DATA horizontal position.
+       Increase this value to move it right; decrease it to move it left. */
+    .st-key-export_status {
+        padding-left: 0px !important;
+        margin-left: 0px !important;
+        transform: translateX(16px) !important;
+    }
+    /* Hide the tiny autorefresh component so it does not create blank space. */
+    iframe[title*="streamlit_autorefresh"],
+    iframe[src*="streamlit_autorefresh"] {
+        display: none !important;
+        height: 0px !important;
+        min-height: 0px !important;
+    }
+    div[data-testid="stIFrame"]:has(iframe[title*="streamlit_autorefresh"]) {
+        display: none !important;
+        height: 0px !important;
+        min-height: 0px !important;
+        margin: 0 !important;
+        padding: 0 !important;
+    }
+    .st-key-export_status div.stDownloadButton {
+        padding-left: 0px !important;
+        margin-left: 0px !important;
+    }
+    .st-key-export_status button,
+    .st-key-export_status div.stDownloadButton > button {
+        margin-left: 0px !important;
+    }
+    div.stDownloadButton > button { background: transparent !important; border: none !important; box-shadow: none !important; color: #060b3f !important; font-weight: 800 !important; letter-spacing: 1px !important; font-size: 11px !important; padding: 0 !important; min-height: 0 !important; }
+    div.stDownloadButton > button:hover { color: #52b83f !important; background: transparent !important; }
+    div.stDownloadButton > button p { font-weight: 800 !important; letter-spacing: 1px !important; font-size: 11px !important; margin:0 !important; }
+
+    /* Compress generic vertical spacing */
+    div[data-testid="stVerticalBlock"] { gap: 0.1rem; }
+    div[data-testid="stElementContainer"] { margin: 0 !important; }
+    div[data-testid="stMarkdownContainer"] { margin: 0 !important; }
+    div[data-testid="stMainBlockContainer"] { padding-top: 0.5rem !important; }
+
+    /* Settings gear - compact */
+    .st-key-btn_settings button {
+        background: transparent !important;
+        border: none !important;
+        box-shadow: none !important;
+        color: #060b3f !important;
+        padding: 0 !important;
+        margin: 0 !important;
+        min-height: 0 !important;
+        height: 30px !important;
+        width: 30px !important;
+        line-height: 1 !important;
+        display: flex !important;
+        align-items: center !important;
+        justify-content: center !important;
+    }
+    .st-key-btn_settings button p {
+        font-size: 25px !important;
+        line-height: 1 !important;
+        margin: 0 !important;
+        padding: 0 !important;
+        color: #060b3f !important;
+    }
+    .st-key-btn_settings button:hover { color: #52b83f !important; background: transparent !important; }
+    .st-key-btn_settings button:hover p { color: #52b83f !important; }
+
+    /* Light / dark switch - one real Streamlit button.
+       The selected half, sun, and moon are drawn separately so nothing wraps or overlaps. */
+    .st-key-theme_toggle_btn {
+        display: flex !important;
+        justify-content: flex-end !important;
+        align-items: center !important;
+        height: 26px !important;
+        min-height: 26px !important;
+        margin-right: 28px !important;
+    }
+    .st-key-theme_toggle_btn button {
+        position: relative !important;
+        box-sizing: border-box !important;
+        width: 112px !important;
+        height: 28px !important;
+        min-height: 28px !important;
+        padding: 0 !important;
+        margin: 0 !important;
+        border: 1.5px solid #060b3f !important;
+        border-radius: 999px !important;
+        box-shadow: none !important;
+        background: #ffffff !important;
+        overflow: hidden !important;
+    }
+    /* selected side of the pill */
+    .st-key-theme_toggle_btn button::before {
+        content: "";
+        position: absolute;
+        z-index: 1;
+        top: 1.9px;
+        left: 8px;
+        width: 48px;
+        height: 22px;
+        border-radius: 999px;
+        background: #060b3f;
+        transition: left 0.15s ease;
+        pointer-events: none;
+    }
+    /* hide real button text, but keep this <p> as a positioning layer */
+    .st-key-theme_toggle_btn button p {
+        position: absolute !important;
+        inset: 0 !important;
+        display: block !important;
+        width: 100% !important;
+        height: 100% !important;
+        margin: 0 !important;
+        padding: 0 !important;
+        font-size: 0 !important;
+        line-height: 0 !important;
+        color: transparent !important;
+        visibility: visible !important;
+        pointer-events: none !important;
+        z-index: 2 !important;
+    }
+    .st-key-theme_toggle_btn button p::before {
+        content: "☀";
+        position: absolute;
+        left: 27px;
+        top: 50%;
+        transform: translate(-50%, -50%);
+        font-size: 17px;
+        line-height: 1;
+        color: #ffffff;
+        z-index: 3;
+    }
+    .st-key-theme_toggle_btn button p::after {
+        content: "☾";
+        position: absolute;
+        left: 75px;
+        top: 50%;
+        transform: translate(-50%, -50%);
+        font-size: 18px;
+        line-height: 1;
+        color: #060b3f;
+        z-index: 3;
+    }
+    .st-key-theme_toggle_btn button:hover {
+        border-color: #060b3f !important;
+        background: #ffffff !important;
+    }
+    .st-key-theme_toggle_btn button:focus,
+    .st-key-theme_toggle_btn button:active {
+        outline: none !important;
+        box-shadow: none !important;
+        border-color: #060b3f !important;
+    }
+
+    /* Settings page */
+    .settings-title { font-size: 25px; font-weight: 500; color: #060b3f; margin: 12px 0 34px 0; }
+    .settings-sub { font-size: 20px; font-weight: 500; color: #060b3f; margin: 0 0 24px 0; }
+    .settings-row-label { font-size: 15px; font-weight: 700; color: #060b3f; padding: 0; line-height: 1; }
+    .settings-divider { border-top: 1px solid #e2e2e5; height: 0; margin: 0; padding: 0; }
+
+    .st-key-settings_temp_row,
+    .st-key-settings_pressure_row {
+        height: 54px !important;
+        min-height: 54px !important;
+        display: flex !important;
+        align-items: center !important;
+        margin: 0 !important;
+        padding: 0 !important;
+    }
+    .st-key-settings_temp_row > div,
+    .st-key-settings_pressure_row > div {
+        width: 100% !important;
+        height: 54px !important;
+        display: flex !important;
+        align-items: center !important;
+    }
+    .st-key-settings_temp_row div[data-testid="stHorizontalBlock"],
+    .st-key-settings_pressure_row div[data-testid="stHorizontalBlock"] {
+        align-items: center !important;
+        height: 54px !important;
+    }
+    .st-key-temp_unit_radio,
+    .st-key-pressure_unit_radio {
+        display: flex !important;
+        align-items: center !important;
+        justify-content: flex-end !important;
+        height: 54px !important;
+        margin: 0 !important;
+        padding: 0 !important;
+    }
+
+    .settings-x-row { display: flex; justify-content: space-between; align-items: center; margin-bottom: 26px; }
+    .st-key-close_settings_x button {
+        background: transparent !important;
+        border: none !important;
+        box-shadow: none !important;
+        color: #060b3f !important;
+        min-height: 0 !important;
+        height: 34px !important;
+        width: 34px !important;
+        padding: 0 !important;
+        margin: 0 !important;
+    }
+    .st-key-close_settings_x button p {
+        color: #060b3f !important;
+        font-size: 34px !important;
+        line-height: 1 !important;
+        margin: 0 !important;
+        font-weight: 300 !important;
+    }
+    .st-key-close_settings_x button:hover { background: transparent !important; }
+    .st-key-close_settings_x button:hover p { color: #52b83f !important; }
+
+    /* Pill unit selectors in settings */
+    /* Hide the actual Streamlit radio widget labels; keep only the °F/°C and mb/in choices */
+    .st-key-temp_unit_radio [data-testid="stWidgetLabel"],
+    .st-key-pressure_unit_radio [data-testid="stWidgetLabel"] {
+        display: none !important;
+        height: 0 !important;
+        margin: 0 !important;
+        padding: 0 !important;
+    }
+
+    .st-key-temp_unit_radio div[role="radiogroup"],
+    .st-key-pressure_unit_radio div[role="radiogroup"] {
+        display: flex !important;
+        align-items: center !important;
+        justify-content: center !important;
+        gap: 0 !important;
+        width: 122px !important;
+        height: 34px !important;
+        min-height: 34px !important;
+        padding: 1px !important;
+        margin: 0 !important;
+        border: 1.5px solid #060b3f !important;
+        border-radius: 999px !important;
+        overflow: hidden !important;
+        background: #ffffff !important;
+    }
+    .st-key-temp_unit_radio label,
+    .st-key-pressure_unit_radio label {
+        flex: 1 1 50% !important;
+        height: 30px !important;
+        min-height: 30px !important;
+        margin: 0 !important;
+        padding: 0 !important;
+        display: flex !important;
+        align-items: center !important;
+        justify-content: center !important;
+        border-radius: 999px !important;
+        cursor: pointer !important;
+        opacity: 1 !important;
+    }
+    .st-key-temp_unit_radio label > div:first-child,
+    .st-key-pressure_unit_radio label > div:first-child { display: none !important; }
+    .st-key-temp_unit_radio label p,
+    .st-key-pressure_unit_radio label p {
+        color: #060b3f !important;
+        font-size: 15px !important;
+        line-height: 30px !important;
+        font-weight: 700 !important;
+        margin: 0 !important;
+        padding: 0 !important;
+        width: 100% !important;
+        text-align: center !important;
+    }
+    .st-key-temp_unit_radio label:has(input:checked),
+    .st-key-pressure_unit_radio label:has(input:checked) {
+        background: #060b3f !important;
+    }
+    .st-key-temp_unit_radio label:has(input:checked) p,
+    .st-key-pressure_unit_radio label:has(input:checked) p {
+        color: #ffffff !important;
+    }
+
+
+
+    /* Graph page SensorPush-style layout */
+    .graph-page-wrap { margin-top: 0px; }
+    .graph-filter input { width: 100% !important; }
+    .graph-sensor-mini {
+        border-bottom: 1px solid #e2e2e5;
+        padding: 12px 0 12px 0;
+        color: #060b3f;
+    }
+    .graph-sensor-head {
+        display: grid;
+        grid-template-columns: 34px 1fr;
+        column-gap: 10px;
+        align-items: center;
+        margin-bottom: 8px;
+    }
+    .graph-sensor-square { width: 30px; height: 30px; background:#52b83f; border-radius: 7px; }
+    .graph-sensor-name { font-size: 16px; font-weight: 700; color:#060b3f; }
+    .graph-sensor-time { font-size: 10px; color:#20285c; margin-top: 2px; }
+    .graph-mini-row {
+        display: grid;
+        grid-template-columns: 1fr 1.35fr;
+        column-gap: 10px;
+        align-items: center;
+        margin: 8px 0;
+    }
+    .graph-mini-label { font-size: 10px; font-weight: 700; letter-spacing: 0.4px; color:#20285c; }
+    .graph-mini-value { font-size: 24px; font-weight: 300; line-height: 1; color:#30355e; text-align:left; }
+    .graph-mini-bar { height: 24px; background:#e7e8ee; position:relative; overflow:hidden; }
+    .graph-mini-line { position:absolute; left:0; right:0; top:11px; height:2px; background:#060b3f; }
+    .graph-mini-dot { position:absolute; top:7px; width:9px; height:9px; border-radius:50%; background:#060b3f; }
+    .graph-legend { display:flex; gap:34px; align-items:center; margin:10px 0 8px 0; margin-left:46px; font-size:12px; font-weight:700; color:#060b3f; }
+    .graph-legend-item { display:flex; gap:9px; align-items:center; text-transform:uppercase; }
+    .graph-legend-dot { width:12px; height:12px; border-radius:50%; display:inline-block; }
+    .graph-section-title { font-size: 12px; font-weight:800; letter-spacing:0.4px; color:#060b3f; margin: 10px 0 4px 0; }
+    .graph-date-row { display:flex; justify-content:flex-end; align-items:center; gap:14px; color:#777b88; font-size:13px; margin-top:2px; }
+    .graph-range-pill { font-weight:800; color:#060b3f; margin-left:6px; }
+    .graph-scroll-note { font-size:10px; color:#9a9aa0; margin-top:4px; }
+
+
+
+    /* Refined SensorPush-style graph page */
+    .st-key-graph_sensor_filter {
+        margin-top: 36px !important;
+        margin-bottom: 8px !important;
+    }
+    .st-key-graph_sensor_filter input {
+        height: 38px !important;
+        font-size: 14px !important;
+        border-radius: 4px !important;
+    }
+    .graph-sensor-mini {
+        padding: 12px 0 14px 0 !important;
+        border-bottom: 1px solid #edf0f4 !important;
+        position: relative !important;
+    }
+    .graph-sensor-head {
+        grid-template-columns: 34px 1fr !important;
+        margin-bottom: 8px !important;
+    }
+    .graph-sensor-square {
+        width: 32px !important;
+        height: 32px !important;
+        border-radius: 7px !important;
+    }
+    .graph-sensor-name {
+        font-size: 16px !important;
+        line-height: 1.1 !important;
+    }
+    .graph-sensor-time {
+        font-size: 10px !important;
+        margin-top: 3px !important;
+    }
+    .graph-mini-row {
+        grid-template-columns: 1fr 1.15fr !important;
+        column-gap: 12px !important;
+        margin: 7px 0 !important;
+    }
+    .graph-mini-label {
+        font-size: 9px !important;
+        line-height: 1.25 !important;
+        text-align: left !important;
+    }
+    .graph-mini-value {
+        font-size: 24px !important;
+        line-height: 0.95 !important;
+        text-align: left !important;
+    }
+    .graph-mini-bar {
+        height: 22px !important;
+    }
+    .graph-mini-line { top: 10px !important; }
+    .graph-mini-dot { top: 6px !important; }
+
+
+    /* Push the graph-page sensor search bar down from the divider. */
+    .st-key-graph_sensor_filter {
+        margin-top: 0px !important;
+        margin-bottom: 14px !important;
+    }
+    .st-key-graph_sensor_filter div[data-testid="stTextInput"] {
+        margin-top: 0 !important;
+        margin-bottom: 0 !important;
+    }
+
+    /* Custom SensorPush-style graph sensor toggle buttons.
+       OFF = light gray track + white knob on the left.
+       ON  = light gray track + green knob on the right.
+       These are now placed in the top-right header area of each mini card, not pulled with a large transform. */
+    div[class*="st-key-graph_toggle_btn_"] {
+        display:flex !important;
+        justify-content:flex-end !important;
+        align-items:center !important;
+        height:32px !important;
+        min-height:32px !important;
+        margin:0 !important;
+        padding:0 !important;
+        overflow:visible !important;
+        position: relative !important;
+        left: 0px !important;
+        width: 100% !important;
+    }
+    div[class*="st-key-graph_toggle_btn_"] button {
+        position:relative !important;
+        width:46px !important;
+        height:24px !important;
+        min-height:24px !important;
+        padding:0 !important;
+        margin:0 !important;
+        border:0 !important;
+        border-radius:999px !important;
+        background:#e8e8e8 !important;
+        box-shadow:none !important;
+        overflow:hidden !important;
+    }
+    div[class*="st-key-graph_toggle_btn_"] button p { display:none !important; }
+    div[class*="st-key-graph_toggle_btn_"] button::after {
+        content:"";
+        position:absolute;
+        top:2px;
+        left:2px;
+        width:20px;
+        height:20px;
+        border-radius:50%;
+        background:#ffffff;
+        box-shadow:0 1px 2px rgba(0,0,0,0.12);
+    }
+    div[class*="st-key-graph_toggle_btn_"] button:hover {
+        background:#e8e8e8 !important;
+        border:0 !important;
+        box-shadow:none !important;
+    }
+
+    /* Streamlit wrappers used to build the mini graph sensor cards */
+    div[class*="st-key-graph_card_wrap_"] {
+        border-bottom: 1px solid #edf0f4 !important;
+        padding: 12px 0 14px 0 !important;
+        margin: 0 !important;
+    }
+    div[class*="st-key-graph_card_wrap_"] div[data-testid="stHorizontalBlock"] {
+        align-items: center !important;
+        gap: 0.5rem !important;
+    }
+
+    .graph-top-controls {
+        display:flex;
+        justify-content:flex-end;
+        align-items:center;
+        gap:10px;
+        min-height:28px;
+        color:#8e9097;
+        font-size:13px;
+        margin:0 0 2px 0;
+        white-space:nowrap;
+    }
+    .graph-control-strip {
+        display:flex;
+        justify-content:flex-end;
+        align-items:center;
+        gap:13px;
+        min-height:30px;
+        color:#8e9097;
+        font-size:13px;
+        white-space:nowrap;
+    }
+    .graph-control-strip .calendar-icon {
+        color:#060b3f;
+        font-size:18px;
+        font-weight:700;
+        margin-left:10px;
+    }
+    .graph-range-control-row {
+        display:flex !important;
+        justify-content:flex-end !important;
+        align-items:center !important;
+        gap:4px !important;
+        min-height:28px !important;
+    }
+    .graph-top-controls .calendar-icon,
+    .graph-top-controls .refresh-icon {
+        color:#060b3f;
+        font-size:18px;
+        font-weight:700;
+    }
+
+    /* H / D / W / M / Y range buttons as plain SensorPush-style text */
+    div[class*="st-key-graph_range_btn_"] {
+        display:flex !important;
+        align-items:center !important;
+        justify-content:center !important;
+        min-height:24px !important;
+        width:14px !important;
+        max-width:14px !important;
+        flex:0 0 14px !important;
+    }
+    div[class*="st-key-graph_range_btn_"] button {
+        background:transparent !important;
+        border:0 !important;
+        box-shadow:none !important;
+        padding:0 !important;
+        margin:0 !important;
+        min-height:0 !important;
+        height:18px !important;
+        width:14px !important;
+        min-width:14px !important;
+        color:#060b3f !important;
+    }
+    div[class*="st-key-graph_range_btn_"] button p {
+        font-size:12px !important;
+        font-weight:800 !important;
+        line-height:1 !important;
+        margin:0 !important;
+        padding:0 !important;
+        color:inherit !important;
+    }
+    div[class*="st-key-graph_range_btn_"] button:hover {
+        background:transparent !important;
+        color:#52b83f !important;
+    }
+
+    .graph-legend {
+        margin: 4px 0 12px 46px !important;
+        gap: 42px !important;
+        font-size: 12px !important;
+    }
+    .graph-section-title {
+        margin: 7px 0 3px 0 !important;
+        font-size: 12px !important;
+    }
+    .vega-actions { display:none !important; }
+
+    .graph-date-range-footer {
+        display:flex;
+        justify-content:space-between;
+        font-size:11px;
+        font-weight:800;
+        color:#060b3f;
+        margin-top:4px;
+    }
+
+    #MainMenu {visibility: hidden;}
+    footer {visibility: hidden;}
+    header {visibility: hidden;}
+    </style>
+    """, unsafe_allow_html=True
+)
+
+if "theme" not in st.session_state:
+    st.session_state["theme"] = "light"
+if "temp_unit" not in st.session_state:
+    st.session_state["temp_unit"] = "\u00b0C"
+if "pressure_unit" not in st.session_state:
+    st.session_state["pressure_unit"] = "mb"
+if "show_settings" not in st.session_state:
+    st.session_state["show_settings"] = False
+if "graph_range" not in st.session_state:
+    st.session_state["graph_range"] = "D"
+
+if st.session_state["theme"] == "dark":
+    st.markdown(
+        """
+        <style>
+        .stApp { background-color: #050609 !important; color: #f4f6ff !important; }
+        .stApp p, .stApp label, .stApp span, .stMarkdown, .stMarkdown p { color: #f4f6ff !important; }
+        .logo-text, .section-title, .sensor-name, .gateway-name { color: #f4f6ff !important; }
+        .sensor-card, .gateway-card { background-color: #0b0d14 !important; border: 1.4px solid #3a425c !important; }
+        .sensor-card-header { border-color: #3a425c !important; }
+        .metric-value { color: #f4f6ff !important; }
+        .metric-label, .sensor-time, .gateway-time, .sensor-type, .battery-row { color: #f4f6ff !important; }
+        div[data-testid="stTextInput"] input { background-color: #0b0d14 !important; border: 1.4px solid #3a425c !important; color: #f4f6ff !important; }
+        div[data-testid="stTextInput"] input::placeholder { color: #b9bed6 !important; }
+        div[data-testid="stTextInput"] input:focus {
+            border-color: #58637f !important;
+            box-shadow: 0 0 0 1px #58637f !important;
+        }
+        .bar-track { background-color: #191c2a !important; }
+        .bar-line { background-color: #f4f6ff !important; }
+        .bar-dot { background-color: #f4f6ff !important; }
+        .signal-bars span { background-color: #f4f6ff !important; }
+        .top-bar { border-color: #252a3a !important; }
+        .legend, .legend-item { color: #f4f6ff !important; }
+        .st-key-main_nav div[role="radiogroup"] label p { color: #f4f6ff !important; }
+        .st-key-main_nav div[role="radiogroup"] label:has(input:checked) p { background-color: #30375e !important; }
+        div.stDownloadButton > button, div.stDownloadButton > button p { color: #f4f6ff !important; }
+        div.stDownloadButton > button:hover { color: #6fd65a !important; }
+        .st-key-btn_settings button { color: #f4f6ff !important; }
+        .st-key-btn_settings button p { color: #f4f6ff !important; }
+        .st-key-btn_settings button:hover { color: #6fd65a !important; }
+        .st-key-btn_settings button:hover p { color: #6fd65a !important; }
+        .st-key-theme_toggle_btn button { border-color: #f4f6ff !important; color: #f4f6ff !important; }
+        .st-key-theme_toggle_btn button:hover { border-color: #f4f6ff !important; color: #f4f6ff !important; }
+        .header-divider { border-color: #252a3a !important; }
+        .settings-title, .settings-sub, .settings-row-label { color: #f4f6ff !important; }
+        .settings-card-html { background: #0b0d14 !important; border-color: #252a3a !important; }
+        .st-key-close_settings_x button p { color: #e8eaf3 !important; }
+        .st-key-close_settings_x button:hover p { color: #6fd65a !important; }
+        .st-key-temp_unit_radio div[role="radiogroup"],
+        .st-key-pressure_unit_radio div[role="radiogroup"] {
+            background: #0c1230 !important;
+            border-color: #e8eaf3 !important;
+        }
+        .st-key-temp_unit_radio label p,
+        .st-key-pressure_unit_radio label p { color: #e8eaf3 !important; }
+        .st-key-temp_unit_radio label:has(input:checked),
+        .st-key-pressure_unit_radio label:has(input:checked) { background: #e8eaf3 !important; }
+        .st-key-temp_unit_radio label:has(input:checked) p,
+        .st-key-pressure_unit_radio label:has(input:checked) p { color: #060b3f !important; }
+        .stApp p, .stApp label, .stApp span { color: #f4f6ff !important; }
+        </style>
+        """, unsafe_allow_html=True
+    )
+
+# Active half of the light/dark pill. Icons are drawn with CSS pseudo-elements to avoid wrapping.
+if st.session_state.get("theme", "light") == "light":
+    st.markdown(
+        """
+        <style>
+        .st-key-theme_toggle_btn button::before { left: 3px !important; background: #060b3f !important; }
+        .st-key-theme_toggle_btn button p::before { color: #ffffff !important; }
+        .st-key-theme_toggle_btn button p::after { color: #060b3f !important; }
+        </style>
+        """, unsafe_allow_html=True
+    )
+else:
+    st.markdown(
+        """
+        <style>
+        .st-key-theme_toggle_btn button { background: #050609 !important; border-color: #f4f6ff !important; }
+        .st-key-theme_toggle_btn button::before { left: 49px !important; background: #e8eaf3 !important; }
+        .st-key-theme_toggle_btn button p::before { color: #f4f6ff !important; opacity: 1 !important; text-shadow: 0 0 3px rgba(244,246,255,0.65) !important; }
+        .st-key-theme_toggle_btn button p::after { color: #060b3f !important; }
+        .st-key-theme_toggle_btn button:hover { background: #050609 !important; border-color: #f4f6ff !important; }
+        </style>
+        """, unsafe_allow_html=True
+    )
+
+BASE_URL = "https://api.sensorpush.com/api/v1"
+
+
+def get_secret(name, default=None):
+    """Read credentials from Streamlit Secrets first, then environment variables.
+
+    On Streamlit Cloud, add these in App settings -> Secrets:
+        SENSORPUSH_EMAIL = "..."
+        SENSORPUSH_PASSWORD = "..."
+        LOCAL_TIMEZONE = "America/Toronto"
+    """
+    try:
+        if name in st.secrets:
+            return st.secrets[name]
+    except Exception:
+        pass
+    return os.environ.get(name, default)
+
+
+def fahrenheit_to_celsius(temp_f):
+    return (temp_f - 32) * 5 / 9
+
+
+@st.cache_data(ttl=20 * 60, show_spinner=False)
+def get_access_token_cached(email, password):
+    authorize_response = requests.post(
+        f"{BASE_URL}/oauth/authorize",
+        headers={"accept": "application/json", "Content-Type": "application/json"},
+        json={"email": email, "password": password},
+        timeout=30,
+    )
+    authorize_response.raise_for_status()
+    authorization = authorize_response.json()["authorization"]
+
+    access_response = requests.post(
+        f"{BASE_URL}/oauth/accesstoken",
+        headers={"accept": "application/json", "Content-Type": "application/json"},
+        json={"authorization": authorization},
+        timeout=30,
+    )
+    access_response.raise_for_status()
+    return access_response.json()["accesstoken"]
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def fetch_sensorpush_data(email, password, local_timezone, sample_limit=500):
+    """Fetch recent SensorPush samples directly from the API.
+
+    This cloud version does not use sensorpush.db or collector.py. It is meant for
+    Streamlit Community Cloud, where local SQLite files are not reliable storage.
+    """
+    access_token = get_access_token_cached(email, password)
+
+    sensors_response = requests.post(
+        f"{BASE_URL}/devices/sensors",
+        headers={
+            "accept": "application/json",
+            "Authorization": access_token,
+            "Content-Type": "application/json",
+        },
+        json={},
+        timeout=30,
+    )
+    sensors_response.raise_for_status()
+    sensors = sensors_response.json()
+
+    samples_response = requests.post(
+        f"{BASE_URL}/samples",
+        headers={
+            "accept": "application/json",
+            "Authorization": access_token,
+            "Content-Type": "application/json",
+        },
+        json={"limit": sample_limit},
+        timeout=30,
+    )
+    samples_response.raise_for_status()
+    samples = samples_response.json()
+
+    rows = []
+    for sensor_id, readings in samples.get("sensors", {}).items():
+        sensor_name = sensors.get(sensor_id, {}).get("name", sensor_id)
+        for reading in readings or []:
+            observed_time = reading.get("observed")
+            temperature_f = reading.get("temperature")
+            humidity = reading.get("humidity")
+            pressure = reading.get("barometric_pressure")
+            voltage = reading.get("voltage")
+
+            if not observed_time or temperature_f is None or humidity is None:
+                continue
+
+            rows.append({
+                "timestamp": observed_time,
+                "sensor_id": sensor_id,
+                "sensor_name": sensor_name,
+                "temperature_c": fahrenheit_to_celsius(float(temperature_f)),
+                "humidity": float(humidity) if humidity is not None else None,
+                "barometric_pressure_inhg": float(pressure) if pressure is not None else None,
+                "voltage": float(voltage) if voltage is not None else None,
+                "source": "sensorpush_api_direct",
+            })
+
+    df = pd.DataFrame(rows)
+    if df.empty:
+        return df
+
+    tz = ZoneInfo(local_timezone)
+    df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
+    df["timestamp"] = df["timestamp"].dt.tz_convert(tz)
+    df["timestamp_display"] = df["timestamp"].dt.strftime("%m/%d %I:%M %p")
+    df["pressure_mb"] = df["barometric_pressure_inhg"] * 33.8639
+    return df.sort_values("timestamp")
+
+
+def load_data():
+    email = get_secret("SENSORPUSH_EMAIL")
+    password = get_secret("SENSORPUSH_PASSWORD")
+    local_timezone = get_secret("LOCAL_TIMEZONE", "America/Toronto")
+
+    if not email or not password:
+        st.error("SensorPush credentials are missing.")
+        st.info(
+            "On Streamlit Cloud, add SENSORPUSH_EMAIL and SENSORPUSH_PASSWORD in "
+            "App settings → Secrets. Also add LOCAL_TIMEZONE = \"America/Toronto\"."
+        )
+        st.stop()
+
+    return fetch_sensorpush_data(email, password, local_timezone)
+
+def is_normal(temp, humidity):
+    return (TEMP_MIN <= temp <= TEMP_MAX) and (HUMIDITY_MIN <= humidity <= HUMIDITY_MAX)
+
+def scale_position(value, low, high):
+    if pd.isna(value):
+        return 50
+    position = (value - low) / (high - low) * 100
+    return max(5, min(95, position))
+
+def render_sensor_card(row):
+    sensor_name = row["sensor_name"]
+    temp = row["temperature_c"]
+    humidity = row["humidity"]
+    pressure_mb = row["pressure_mb"]
+    timestamp = row["timestamp_display"]
+
+    voltage = f"{row['voltage']:.2f}" if "voltage" in row and pd.notna(row.get("voltage")) else "3.14"
+
+    temp_unit = st.session_state.get("temp_unit", "\u00b0C")
+    pressure_unit = st.session_state.get("pressure_unit", "mb")
+
+    if temp_unit == "\u00b0F":
+        temp_display = temp * 9 / 5 + 32
+        temp_str = f"{temp_display:.1f}&deg;F"
+    else:
+        temp_str = f"{temp:.1f}&deg;C"
+
+    if pressure_unit == "in":
+        pressure_display = pressure_mb / 33.8639
+        pressure_str = f"{pressure_display:.2f}in"
+    else:
+        pressure_str = f"{pressure_mb:.1f}mb"
+
+    normal = is_normal(temp, humidity)
+
+    temp_pos = scale_position(temp, *TEMP_SCALE)
+    humidity_pos = scale_position(humidity, *HUMIDITY_SCALE)
+    pressure_pos = scale_position(pressure_mb, *PRESSURE_SCALE)
+
+    square_class = "sensor-square" if normal else "sensor-square-red"
+
+    temp_ok = TEMP_MIN <= temp <= TEMP_MAX
+    hum_ok = HUMIDITY_MIN <= humidity <= HUMIDITY_MAX
+    
+    temp_dot = "bar-dot" if temp_ok else "bar-dot-red"
+    hum_dot = "bar-dot" if hum_ok else "bar-dot-red"
+    temp_track = "bar-track" if temp_ok else "bar-track hatched"
+
+    return f"""
+<div class="sensor-card">
+    <div class="sensor-card-header">
+        <div class="sensor-left-header">
+            <div class="{square_class}"></div>
+            <div>
+                <div class="sensor-name">{sensor_name}</div>
+                <div class="sensor-time">LAST READING: {timestamp}</div>
+            </div>
+        </div>
+        <div>
+            <div class="battery-row">
+                <svg width="24" height="12" viewBox="0 0 24 12" fill="none" stroke="currentColor" stroke-width="1.5" style="margin-right:2px; vertical-align:middle;">
+                    <rect x="1.5" y="1.5" width="18" height="9" rx="1.5" />
+                    <path d="M22.5 4V8" stroke-linecap="round" />
+                </svg>
+                <span>{voltage}V</span>
+                <span class="signal-bars" style="margin-left:4px;"><span></span><span></span><span></span><span></span></span>
+            </div>
+            <div class="sensor-type">HTP.xw</div>
+        </div>
+    </div>
+
+    <div class="metric-row">
+        <div>
+            <div class="metric-label">TEMPERATURE</div>
+            <div class="metric-value">{temp_str}</div>
+        </div>
+        <div class="{temp_track}">
+            <div class="bar-line"></div>
+            <div class="{temp_dot}" style="left: {temp_pos}%;"></div>
+        </div>
+    </div>
+
+    <div class="metric-row">
+        <div>
+            <div class="metric-label">RELATIVE HUMIDITY</div>
+            <div class="metric-value">{humidity:.1f}%</div>
+        </div>
+        <div class="bar-track">
+            <div class="bar-line"></div>
+            <div class="{hum_dot}" style="left: {humidity_pos}%;"></div>
+        </div>
+    </div>
+
+    <div class="metric-row">
+        <div>
+            <div class="metric-label">BAROMETRIC PRESSURE</div>
+            <div class="metric-value">{pressure_str}</div>
+        </div>
+        <div class="bar-track">
+            <div class="bar-line"></div>
+            <div class="bar-dot" style="left: {pressure_pos}%;"></div>
+        </div>
+    </div>
+</div>
+"""
+
+
+def safe_key(text):
+    return re.sub(r"[^A-Za-z0-9_]+", "_", str(text)).strip("_")
+
+
+def render_graph_sensor_card(row):
+    sensor_name = row["sensor_name"]
+    temp = row["temperature_c"]
+    humidity = row["humidity"]
+    pressure_mb = row["pressure_mb"]
+    timestamp = row["timestamp_display"]
+
+    temp_unit = st.session_state.get("temp_unit", "°C")
+    pressure_unit = st.session_state.get("pressure_unit", "mb")
+
+    if temp_unit == "°F":
+        temp_value = temp * 9 / 5 + 32
+        temp_str = f"{temp_value:.1f}&deg;F"
+    else:
+        temp_str = f"{temp:.1f}&deg;C"
+
+    if pressure_unit == "in":
+        pressure_value = pressure_mb / 33.8639
+        pressure_str = f"{pressure_value:.2f}in"
+    else:
+        pressure_str = f"{pressure_mb:.1f}mb"
+
+    temp_pos = scale_position(temp, *TEMP_SCALE)
+    humidity_pos = scale_position(humidity, *HUMIDITY_SCALE)
+    pressure_pos = scale_position(pressure_mb, *PRESSURE_SCALE)
+
+    return f"""
+<div class="graph-sensor-mini">
+    <div class="graph-sensor-head">
+        <div class="graph-sensor-square"></div>
+        <div>
+            <div class="graph-sensor-name">{sensor_name}</div>
+            <div class="graph-sensor-time">LAST READING: {timestamp}</div>
+        </div>
+    </div>
+    <div class="graph-mini-row">
+        <div><div class="graph-mini-label">TEMPERATURE</div><div class="graph-mini-value">{temp_str}</div></div>
+        <div class="graph-mini-bar"><div class="graph-mini-line"></div><div class="graph-mini-dot" style="left:{temp_pos}%;"></div></div>
+    </div>
+    <div class="graph-mini-row">
+        <div><div class="graph-mini-label">RELATIVE HUMIDITY</div><div class="graph-mini-value">{humidity:.1f}%</div></div>
+        <div class="graph-mini-bar"><div class="graph-mini-line"></div><div class="graph-mini-dot" style="left:{humidity_pos}%;"></div></div>
+    </div>
+    <div class="graph-mini-row">
+        <div><div class="graph-mini-label">BAROMETRIC PRESSURE</div><div class="graph-mini-value">{pressure_str}</div></div>
+        <div class="graph-mini-bar"><div class="graph-mini-line"></div><div class="graph-mini-dot" style="left:{pressure_pos}%;"></div></div>
+    </div>
+</div>
+"""
+
+def render_graph_sensor_metrics(row):
+    sensor_name = row["sensor_name"]
+    temp = row["temperature_c"]
+    humidity = row["humidity"]
+    pressure_mb = row["pressure_mb"]
+    timestamp = row["timestamp_display"]
+
+    temp_unit = st.session_state.get("temp_unit", "°C")
+    pressure_unit = st.session_state.get("pressure_unit", "mb")
+
+    if temp_unit == "°F":
+        temp_value = temp * 9 / 5 + 32
+        temp_str = f"{temp_value:.1f}&deg;F"
+    else:
+        temp_str = f"{temp:.1f}&deg;C"
+
+    if pressure_unit == "in":
+        pressure_value = pressure_mb / 33.8639
+        pressure_str = f"{pressure_value:.2f}in"
+    else:
+        pressure_str = f"{pressure_mb:.1f}mb"
+
+    temp_pos = scale_position(temp, *TEMP_SCALE)
+    humidity_pos = scale_position(humidity, *HUMIDITY_SCALE)
+    pressure_pos = scale_position(pressure_mb, *PRESSURE_SCALE)
+
+    return f"""
+    <div class="graph-mini-row">
+        <div><div class="graph-mini-label">TEMPERATURE</div><div class="graph-mini-value">{temp_str}</div></div>
+        <div class="graph-mini-bar"><div class="graph-mini-line"></div><div class="graph-mini-dot" style="left:{temp_pos}%;"></div></div>
+    </div>
+    <div class="graph-mini-row">
+        <div><div class="graph-mini-label">RELATIVE HUMIDITY</div><div class="graph-mini-value">{humidity:.1f}%</div></div>
+        <div class="graph-mini-bar"><div class="graph-mini-line"></div><div class="graph-mini-dot" style="left:{humidity_pos}%;"></div></div>
+    </div>
+    <div class="graph-mini-row">
+        <div><div class="graph-mini-label">BAROMETRIC PRESSURE</div><div class="graph-mini-value">{pressure_str}</div></div>
+        <div class="graph-mini-bar"><div class="graph-mini-line"></div><div class="graph-mini-dot" style="left:{pressure_pos}%;"></div></div>
+    </div>
+    """
+
+def render_graph_sensor_header(row):
+    sensor_name = row["sensor_name"]
+    timestamp = row["timestamp_display"]
+    return f"""
+    <div class="graph-sensor-head" style="margin-bottom:8px;">
+        <div class="graph-sensor-square"></div>
+        <div>
+            <div class="graph-sensor-name">{sensor_name}</div>
+            <div class="graph-sensor-time">LAST READING: {timestamp}</div>
+        </div>
+    </div>
+    """
+
+def graph_window_bounds(max_timestamp, range_label):
+    """Return fixed SensorPush-style graph window start/end for H/D/W/M/Y."""
+    if range_label == "H":
+        delta = pd.Timedelta(hours=1)
+    elif range_label == "D":
+        delta = pd.Timedelta(days=1)
+    elif range_label == "W":
+        delta = pd.Timedelta(days=7)
+    elif range_label == "M":
+        delta = pd.Timedelta(days=30)
+    elif range_label == "Y":
+        delta = pd.Timedelta(days=365)
+    else:
+        delta = pd.Timedelta(days=1)
+    end = max_timestamp
+    start = end - delta
+    return start, end
+
+def graph_axis_format(range_label):
+    """Match official SensorPush axis labels: times for H/D, dates for W/M, month/year for Y."""
+    if range_label in ["H", "D"]:
+        return "%I:%M %p", 5
+    if range_label == "W":
+        return "%m/%d/%Y", 7
+    if range_label == "M":
+        return "%m/%d", 6
+    return "%b %Y", 6
+
+def make_sensorpush_chart(view, metric_col, title, unit_suffix="", height=160, range_label="D", x_start=None, x_end=None, capture_param=None, union_filter=None, show_x_axis=True, y_domain_override=None):
+    if view.empty:
+        return None
+
+    view = view.copy()
+
+    # Build a SensorPush-style hover label for every visible row.
+    # Keep the wording compact: "06/03 1:32 pm, 23.3°C".
+    time_text = view["timestamp"].dt.strftime("%m/%d %I:%M %p").str.replace(" 0", " ", regex=False).str.lower()
+    if unit_suffix == "in":
+        value_text = view[metric_col].map(lambda v: f"{v:.2f}{unit_suffix}")
+    else:
+        value_text = view[metric_col].map(lambda v: f"{v:.1f}{unit_suffix}")
+    view["_hover_label"] = time_text + ", " + value_text
+
+    if y_domain_override is not None:
+        # Keep the vertical scale stable when sensors are turned on/off.
+        # The caller passes a domain based on the full current time window, not just
+        # the currently selected sensors.
+        y_domain = y_domain_override
+    else:
+        y_min = float(view[metric_col].min())
+        y_max = float(view[metric_col].max())
+        y_span = y_max - y_min
+        if y_span <= 0:
+            # Give a flat line a small visible window, but do not over-pad changing data.
+            padding = max(abs(y_max) * 0.002, 0.05)
+        else:
+            # Tight local scale, used only when no external stable domain is supplied.
+            padding = max(y_span * 0.08, 0.03)
+
+        y_domain = [y_min - padding, y_max + padding]
+    axis_format, tick_count = graph_axis_format(range_label)
+    x_scale = alt.Scale(domain=[x_start, x_end]) if x_start is not None and x_end is not None else alt.Scale()
+
+    # Only the bottom chart shows time labels (clean line + a few ticks). The upper charts
+    # share the same x-range but hide their axis so the column reads like the official site.
+    if show_x_axis:
+        x_axis = alt.Axis(
+            format=axis_format,
+            tickCount=tick_count,
+            labelColor="#505670",
+            labelFontSize=11,
+            tickColor="#bfc2cc",
+            tickSize=5,
+            domainColor="#bfc2cc",
+            domainWidth=1,
+            grid=False,
+            title=None,
+        )
+    else:
+        x_axis = alt.Axis(labels=False, ticks=False, domain=False, grid=False, title=None)
+
+    plot_bg = alt.Chart(pd.DataFrame({"x": [x_start], "x2": [x_end], "y": [y_domain[0]], "y2": [y_domain[1]]})).mark_rect(
+        color="#e7e8ee"
+    ).encode(
+        x=alt.X("x:T", scale=x_scale, axis=x_axis),
+        x2="x2:T",
+        y=alt.Y("y:Q", scale=alt.Scale(domain=y_domain, zero=False), axis=alt.Axis(labels=False, ticks=False, domain=False, grid=False), title=None),
+        y2="y2:Q",
+    )
+
+    color_scale = alt.Scale(range=["#52b83f", "#4267bd", "#35a6b9", "#ff9f1c", "#8e44ad"])
+
+    line = alt.Chart(view).mark_line(strokeWidth=1.8, clip=True).encode(
+        x=alt.X("timestamp:T", title=None, scale=x_scale, axis=x_axis),
+        y=alt.Y(
+            f"{metric_col}:Q",
+            title=None,
+            scale=alt.Scale(domain=y_domain, zero=False),
+            axis=alt.Axis(labels=False, ticks=False, domain=False, grid=False),
+        ),
+        color=alt.Color("sensor_name:N", title=None, scale=color_scale, legend=None),
+    )
+
+    mean_value = float(view[metric_col].mean())
+    mean_line = alt.Chart(pd.DataFrame({"y": [mean_value]})).mark_rule(
+        strokeDash=[2, 5], strokeWidth=2, color="#aeb4c6"
+    ).encode(y="y:Q")
+
+    label_x = x_start if x_start is not None else view["timestamp"].min()
+    label_text = f"{mean_value:.1f}{unit_suffix}"
+    label = alt.Chart(pd.DataFrame({"x": [label_x], "y": [mean_value], "label": [label_text]})).mark_text(
+        align="left", baseline="middle", dx=8, fontSize=11, color="#30355e"
+    ).encode(x="x:T", y="y:Q", text="label:N")
+
+    # Hover interaction: vertical crosshair + highlighted dots + SensorPush-style labels.
+    # Each chart gets its OWN capture param (so every plot responds to the pointer). The
+    # selection stores the hovered TIMESTAMP; all visual layers then match every sensor row
+    # whose timestamp equals that value, so the crosshair + a label for EACH sensor appear
+    # on all three charts at once (like the official site).
+    if capture_param is None:
+        capture_param = alt.selection_point(
+            name="sp_hover_0", nearest=True, on="pointerover",
+            fields=["timestamp"], empty=False, clear="pointerout",
+        )
+    if union_filter is None:
+        # Match any datum whose timestamp equals the selected timestamp from this chart.
+        union_filter = (
+            f'(length(data("{capture_param.name}_store")) > 0) && '
+            f'(toNumber(datum.timestamp) == toNumber(data("{capture_param.name}_store")[0].values[0]))'
+        )
+
+    # Invisible selectors capture the pointer for THIS chart. They are built on a set of
+    # UNIQUE timestamps (one row per time), so the nearest-point selection locks onto a
+    # timestamp rather than snapping between individual sensor points (which caused the
+    # hover to cycle through sensors one at a time). The union filter below then expands
+    # that single timestamp to a label for every sensor at that time.
+    unique_times = pd.DataFrame({"timestamp": pd.Series(view["timestamp"].unique())})
+    selectors = alt.Chart(unique_times).mark_point(opacity=0, size=160).encode(
+        x=alt.X("timestamp:T", scale=x_scale),
+        tooltip=alt.value(None),
+    ).add_params(capture_param)
+
+    points = line.mark_point(filled=True, size=85, clip=True).encode(
+        opacity=alt.condition(union_filter, alt.value(1), alt.value(0)),
+        tooltip=alt.value(None),
+    )
+
+    rule = alt.Chart(view).mark_rule(color="#060b3f", strokeDash=[2, 3], strokeWidth=1, opacity=0.9, clip=True).encode(
+        x=alt.X("timestamp:T", scale=x_scale),
+        tooltip=alt.value(None),
+    ).transform_filter(union_filter)
+
+    # Edge-aware flip. The pill is ~158px wide; flip to the LEFT of the crosshair once the
+    # selected timestamp is far enough right that a right-side pill would clip the border.
+    x_start_ms = pd.Timestamp(x_start).value // 10**6 if x_start is not None else int(view["timestamp"].min().value // 10**6)
+    x_end_ms = pd.Timestamp(x_end).value // 10**6 if x_end is not None else int(view["timestamp"].max().value // 10**6)
+    span_ms = max(x_end_ms - x_start_ms, 1)
+    flip_expr = f"(toNumber(datum.timestamp) - {x_start_ms}) / {span_ms} > 0.55"
+
+    yq = alt.Y(f"{metric_col}:Q", scale=alt.Scale(domain=y_domain, zero=False))
+    xt = alt.X("timestamp:T", scale=x_scale)
+    col = alt.Color("sensor_name:N", title=None, scale=color_scale, legend=None)
+
+    hover_base = alt.Chart(view).transform_filter(union_filter).transform_calculate(_flip=flip_expr)
+
+    PILL_W = 158
+    PILL_H = 20
+    bg_right = hover_base.transform_filter("datum._flip == false").mark_rect(
+        width=PILL_W, height=PILL_H, cornerRadius=3, opacity=0.92, xOffset=(10 + PILL_W / 2), clip=True,
+    ).encode(x=xt, y=yq, color=col, tooltip=alt.value(None))
+    text_right = hover_base.transform_filter("datum._flip == false").mark_text(
+        align="left", baseline="middle", dx=16, fontSize=11, color="#ffffff", clip=True,
+    ).encode(x=xt, y=yq, text="_hover_label:N", tooltip=alt.value(None))
+
+    bg_left = hover_base.transform_filter("datum._flip == true").mark_rect(
+        width=PILL_W, height=PILL_H, cornerRadius=3, opacity=0.92, xOffset=-(10 + PILL_W / 2), clip=True,
+    ).encode(x=xt, y=yq, color=col, tooltip=alt.value(None))
+    text_left = hover_base.transform_filter("datum._flip == true").mark_text(
+        align="right", baseline="middle", dx=-16, fontSize=11, color="#ffffff", clip=True,
+    ).encode(x=xt, y=yq, text="_hover_label:N", tooltip=alt.value(None))
+
+    chart_title = alt.TitleParams(
+        text=title,
+        anchor="start",
+        align="left",
+        dx=0,
+        fontSize=12,
+        fontWeight="bold",
+        color="#060b3f",
+        offset=6,
+    )
+
+    # clip is applied at the concat level (configure_* is illegal on a concat subchart).
+    return alt.layer(
+        plot_bg, mean_line, line, label, selectors, rule, points,
+        bg_right, text_right, bg_left, text_left
+    ).properties(
+        height=height,
+        width="container",
+        title=chart_title,
+    )
+
+try:
+    df = load_data()
+except Exception as e:
+    st.error("Could not load SensorPush API data.")
+    st.exception(e)
+    st.stop()
+
+if df.empty:
+    st.warning("No readings returned from SensorPush yet. Try refreshing in a minute.")
+    st.stop()
+
+newest = df.iloc[-1]
+
+# Pushed settings and toggle extremely far right
+head_left, head_spacer, head_toggle, head_settings = st.columns([5.5, 7.0, 1.15, 0.35], vertical_alignment="center")
+
+with head_left:
+    st.markdown(
+        '<div style="display:flex;align-items:center;height:100%;">'
+        '<span class="logo-text">NMSL Environment Monitor</span></div>',
+        unsafe_allow_html=True,
+    )
+
+with head_toggle:
+    if st.button("theme", key="theme_toggle_btn", help="Toggle light/dark mode"):
+        st.session_state["theme"] = "dark" if st.session_state.get("theme", "light") == "light" else "light"
+        st.rerun()
+
+with head_settings:
+    if st.button("\u2699", key="btn_settings", help="Settings"):
+        st.session_state["show_settings"] = not st.session_state["show_settings"]
+        st.rerun()
+
+
+st.markdown('<div class="header-divider" style="margin-top:8px;margin-bottom:0px;"></div>', unsafe_allow_html=True)
+
+def render_settings_panel():
+    # Full settings screen styled like the reference page.
+    top_left, top_right = st.columns([12, 1], vertical_alignment="center")
+    with top_left:
+        st.markdown('<div class="settings-title">Settings</div>', unsafe_allow_html=True)
+    with top_right:
+        if st.button("×", key="close_settings_x", help="Close settings"):
+            st.session_state["show_settings"] = False
+            st.rerun()
+
+    left_gap, center, right_gap = st.columns([1.6, 6.8, 1.6])
+    with center:
+        st.markdown('<div class="settings-sub">Configuration</div>', unsafe_allow_html=True)
+
+        st.markdown('<div class="settings-divider"></div>', unsafe_allow_html=True)
+
+        with st.container(key="settings_temp_row"):
+            row1_label, row1_control = st.columns([4, 1.15], vertical_alignment="center")
+            with row1_label:
+                st.markdown('<div class="settings-row-label">Temperature unit</div>', unsafe_allow_html=True)
+            with row1_control:
+                new_temp = st.radio(
+                    "",
+                    ["°F", "°C"],
+                    index=["°F", "°C"].index(st.session_state["temp_unit"]),
+                    horizontal=True,
+                    label_visibility="collapsed",
+                    key="temp_unit_radio",
+                )
+                if new_temp != st.session_state["temp_unit"]:
+                    st.session_state["temp_unit"] = new_temp
+                    st.rerun()
+
+        st.markdown('<div class="settings-divider"></div>', unsafe_allow_html=True)
+
+        with st.container(key="settings_pressure_row"):
+            row2_label, row2_control = st.columns([4, 1.15], vertical_alignment="center")
+            with row2_label:
+                st.markdown('<div class="settings-row-label">Barometric pressure unit</div>', unsafe_allow_html=True)
+            with row2_control:
+                new_pres = st.radio(
+                    "",
+                    ["mb", "in"],
+                    index=["mb", "in"].index(st.session_state["pressure_unit"]),
+                    horizontal=True,
+                    label_visibility="collapsed",
+                    key="pressure_unit_radio",
+                )
+                if new_pres != st.session_state["pressure_unit"]:
+                    st.session_state["pressure_unit"] = new_pres
+                    st.rerun()
+
+        st.markdown('<div class="settings-divider"></div>', unsafe_allow_html=True)
+
+if st.session_state["show_settings"]:
+    render_settings_panel()
+    st.stop()
+
+tab = st.radio("nav", ["STATUS", "GRAPH"], horizontal=True, label_visibility="collapsed", key="main_nav")
+st.markdown('<div class="header-divider" style="margin-top:0px;margin-bottom:0px;"></div>', unsafe_allow_html=True)
+
+# ===========================================================================
+# STATUS VIEW
+# ===========================================================================
+if tab == "STATUS":
+    if st_autorefresh is not None:
+        st_autorefresh(interval=60 * 1000, key="sensorpush_data_refresh")
+    latest = df.groupby("sensor_name").tail(1).sort_values("sensor_name")
+
+    util_left, util_right = st.columns([1, 2], vertical_alignment="center")
+    with util_left:
+        full_csv = df.drop(columns=["timestamp_display"]).to_csv(index=False).encode("utf-8")
+        st.download_button("\u2193 EXPORT DATA", data=full_csv, file_name="sensorpush_all_readings.csv", mime="text/csv", key="export_status")
+    with util_right:
+        st.markdown(
+            """<div class="legend" style="justify-content:flex-end;">
+                <div class="legend-item"><span class="legend-box-green"></span> NORMAL</div>
+                <div class="legend-item"><span class="legend-box-red"></span> OVER/UNDER LIMIT</div>
+                <div class="legend-item"><span class="legend-box-gray"></span> NOT REPORTING</div>
+            </div>""", unsafe_allow_html=True
+        )
+        
+    # Full width horizontal divider below the export / legend row
+    st.markdown('<div class="header-divider" style="margin-top: 0px; margin-bottom: 12px;"></div>', unsafe_allow_html=True)
+
+    # Gateways
+    st.markdown('<div class="section-title">Gateways</div>', unsafe_allow_html=True)
+    gw_filter = st.text_input("Filter gateways", key="gw_filter", placeholder="Filter gateways", label_visibility="collapsed")
+    
+    if not gw_filter or gw_filter.lower() in "gateway 1":
+        st.markdown(
+            f"""<div class="gateway-card">
+                <div class="gateway-icon"></div>
+                <div><div class="gateway-name">Gateway 1</div><div class="gateway-time">LAST SEEN: {newest["timestamp"].strftime("%m/%d %I:%M %p")}</div></div>
+            </div>""", unsafe_allow_html=True
+        )
+
+    # Sensors
+    st.markdown('<div class="section-title">Sensors</div>', unsafe_allow_html=True)
+    sensor_filter = st.text_input("Filter sensors", key="sensor_filter", placeholder="Filter sensors", label_visibility="collapsed")
+    
+    if sensor_filter:
+        latest = latest[latest["sensor_name"].str.contains(sensor_filter, case=False, na=False)]
+
+    cols = st.columns(3)
+    for index, (_, row) in enumerate(latest.iterrows()):
+        with cols[index % 3]:
+            st.html(render_sensor_card(row))
+
+# ===========================================================================
+# GRAPH VIEW (SensorPush-style historical layout)
+# ===========================================================================
+else:
+    if st_autorefresh is not None:
+        st_autorefresh(interval=60 * 1000, key="sensorpush_graph_refresh")
+
+    latest = df.groupby("sensor_name").tail(1).sort_values("sensor_name")
+    sensor_options = sorted(df["sensor_name"].unique().tolist())
+
+    if "graph_range" not in st.session_state:
+        st.session_state["graph_range"] = "D"
+
+    for sensor in sensor_options:
+        key = f"graph_show_{sensor}"
+        if key not in st.session_state:
+            st.session_state[key] = True
+
+    left_panel, right_panel = st.columns([1.0, 3.15], gap="small")
+
+    with left_panel:
+        st.markdown('<div style="height: 18px;"></div>', unsafe_allow_html=True)
+        graph_filter = st.text_input(
+            "Filter sensors",
+            key="graph_sensor_filter",
+            placeholder="Filter sensors",
+            label_visibility="collapsed",
+        )
+
+        shown_latest = latest.copy()
+        if graph_filter:
+            shown_latest = shown_latest[shown_latest["sensor_name"].str.contains(graph_filter, case=False, na=False)]
+
+        for _, row in shown_latest.iterrows():
+            name = row["sensor_name"]
+            safe = safe_key(name)
+            is_on = st.session_state.get(f"graph_show_{name}", True)
+
+            with st.container(key=f"graph_card_wrap_{safe}"):
+                head_cols = st.columns([0.76, 0.24], vertical_alignment="center")
+                with head_cols[0]:
+                    st.markdown(render_graph_sensor_header(row), unsafe_allow_html=True)
+                with head_cols[1]:
+                    btn_key = f"graph_toggle_btn_{safe}"
+                    if st.button("", key=btn_key, help=f"Show/hide {name}"):
+                        st.session_state[f"graph_show_{name}"] = not is_on
+                        st.rerun()
+                st.markdown(render_graph_sensor_metrics(row), unsafe_allow_html=True)
+
+            if is_on:
+                st.markdown(
+                    f"""
+                    <style>
+                    .st-key-graph_toggle_btn_{safe} button::after {{
+                        left:24px !important;
+                        background:#52b83f !important;
+                    }}
+                    </style>
+                    """,
+                    unsafe_allow_html=True,
+                )
+
+    chosen = [sensor for sensor in sensor_options if st.session_state.get(f"graph_show_{sensor}", True)]
+
+    with right_panel:
+        # One compact control line: Start date → End date, calendar, then H/D/W/M/Y.
+        control_cols = st.columns([2.85, 0.52, 0.14, 0.52, 0.20, 0.13, 0.13, 0.13, 0.13, 0.13], vertical_alignment="center", gap="small")
+        with control_cols[1]:
+            st.markdown('<div class="graph-top-controls">Start date</div>', unsafe_allow_html=True)
+        with control_cols[2]:
+            st.markdown('<div class="graph-top-controls">→</div>', unsafe_allow_html=True)
+        with control_cols[3]:
+            st.markdown('<div class="graph-top-controls">End date</div>', unsafe_allow_html=True)
+        with control_cols[4]:
+            st.markdown('<div class="graph-top-controls"><span class="calendar-icon">▣</span></div>', unsafe_allow_html=True)
+
+        range_label = st.session_state.get("graph_range", "D")
+        for i, range_option in enumerate(["H", "D", "W", "M", "Y"], start=5):
+            with control_cols[i]:
+                if st.button(range_option, key=f"graph_range_btn_{range_option}"):
+                    st.session_state["graph_range"] = range_option
+                    st.rerun()
+
+        # Keep the selected range visibly green. The extra selectors handle Streamlit's
+        # nested markdown/button markup, which can otherwise override the color.
+        range_label = st.session_state.get("graph_range", "D")
+        st.markdown(
+            f"""
+            <style>
+            .st-key-graph_range_btn_{range_label} button,
+            .st-key-graph_range_btn_{range_label} button *,
+            .st-key-graph_range_btn_{range_label} [data-testid="stMarkdownContainer"],
+            .st-key-graph_range_btn_{range_label} [data-testid="stMarkdownContainer"] *,
+            .st-key-graph_range_btn_{range_label} p {{
+                color:#52b83f !important;
+                font-weight:900 !important;
+                opacity:1 !important;
+            }}
+            </style>
+            """,
+            unsafe_allow_html=True,
+        )
+
+        graph_start, graph_end = graph_window_bounds(df["timestamp"].max(), range_label)
+
+        view = df[df["sensor_name"].isin(chosen)].copy()
+        if not view.empty:
+            view = view[(view["timestamp"] >= graph_start) & (view["timestamp"] <= graph_end)]
+
+        if not chosen:
+            st.info("Turn on at least one sensor from the left panel to display graph data.")
+        elif view.empty:
+            st.info("No data in the selected range. Try a wider time range or wait for the collector to log more readings.")
+        else:
+            legend_html = '<div class="graph-legend">'
+            palette = ["#52b83f", "#4267bd", "#35a6b9", "#ff9f1c", "#8e44ad"]
+            for i, sensor in enumerate(chosen):
+                legend_html += f'<div class="graph-legend-item"><span class="graph-legend-dot" style="background:{palette[i % len(palette)]};"></span>{sensor}</div>'
+            legend_html += '</div>'
+            st.markdown(legend_html, unsafe_allow_html=True)
+
+            temp_view = view.copy()
+            temp_unit = st.session_state.get("temp_unit", "°C")
+            if temp_unit == "°F":
+                temp_view["temperature_display"] = temp_view["temperature_c"] * 9 / 5 + 32
+                temp_suffix = "°F"
+            else:
+                temp_view["temperature_display"] = temp_view["temperature_c"]
+                temp_suffix = "°C"
+
+            pressure_view = view.copy()
+            pressure_unit = st.session_state.get("pressure_unit", "mb")
+            if pressure_unit == "in":
+                pressure_view["pressure_display"] = pressure_view["pressure_mb"] / 33.8639
+                pressure_suffix = "in"
+            else:
+                pressure_view["pressure_display"] = pressure_view["pressure_mb"]
+                pressure_suffix = "mb"
+
+            # Each chart captures the pointer with its own param storing the hovered timestamp.
+            # The filter matches EVERY sensor row whose timestamp equals the hovered timestamp
+            # from ANY chart, so hovering one plot shows all sensors' values on all three.
+            hover_params = [
+                alt.selection_point(
+                    name=f"sp_hover_{i}", nearest=True, on="pointerover",
+                    fields=["timestamp"], empty=False, clear="pointerout",
+                )
+                for i in range(3)
+            ]
+            union_filter = " || ".join(
+                f'((length(data("{p.name}_store")) > 0) && '
+                f'(toNumber(datum.timestamp) == toNumber(data("{p.name}_store")[0].values[0])))'
+                for p in hover_params
+            )
+
+            # Build vertical domains from ALL sensors in the current time window. This keeps
+            # each graph's height/scale from jumping or shrinking when individual sensors are
+            # selected/deselected. The domain still updates when the time range changes.
+            full_window = df[(df["timestamp"] >= graph_start) & (df["timestamp"] <= graph_end)].copy()
+
+            def stable_y_domain(domain_df, column):
+                if domain_df.empty or domain_df[column].dropna().empty:
+                    return None
+                y_min = float(domain_df[column].min())
+                y_max = float(domain_df[column].max())
+                y_span = y_max - y_min
+                if y_span <= 0:
+                    padding = max(abs(y_max) * 0.002, 0.05)
+                else:
+                    padding = max(y_span * 0.08, 0.03)
+                return [y_min - padding, y_max + padding]
+
+            temp_domain_view = full_window.copy()
+            if temp_unit == "°F":
+                temp_domain_view["temperature_display"] = temp_domain_view["temperature_c"] * 9 / 5 + 32
+            else:
+                temp_domain_view["temperature_display"] = temp_domain_view["temperature_c"]
+
+            pressure_domain_view = full_window.copy()
+            if pressure_unit == "in":
+                pressure_domain_view["pressure_display"] = pressure_domain_view["pressure_mb"] / 33.8639
+            else:
+                pressure_domain_view["pressure_display"] = pressure_domain_view["pressure_mb"]
+
+            temp_y_domain = stable_y_domain(temp_domain_view, "temperature_display")
+            humidity_y_domain = stable_y_domain(full_window, "humidity")
+            pressure_y_domain = stable_y_domain(pressure_domain_view, "pressure_display")
+
+            temp_chart = make_sensorpush_chart(temp_view, "temperature_display", "TEMPERATURE", temp_suffix, height=155, range_label=range_label, x_start=graph_start, x_end=graph_end, capture_param=hover_params[0], union_filter=union_filter, show_x_axis=False, y_domain_override=temp_y_domain)
+            humidity_chart = make_sensorpush_chart(view, "humidity", "RELATIVE HUMIDITY", "%", height=155, range_label=range_label, x_start=graph_start, x_end=graph_end, capture_param=hover_params[1], union_filter=union_filter, show_x_axis=False, y_domain_override=humidity_y_domain)
+            pressure_chart = make_sensorpush_chart(pressure_view, "pressure_display", "BAROMETRIC PRESSURE", pressure_suffix, height=155, range_label=range_label, x_start=graph_start, x_end=graph_end, capture_param=hover_params[2], union_filter=union_filter, show_x_axis=True, y_domain_override=pressure_y_domain)
+
+            combined_chart = alt.vconcat(
+                temp_chart, humidity_chart, pressure_chart, spacing=8,
+            ).resolve_scale(x="shared", color="shared").properties(
+                padding={"left": 46, "right": 4, "top": 4, "bottom": 0},
+                background="transparent",
+                autosize={"type": "fit-x", "contains": "padding"},
+            ).configure_view(strokeWidth=0).configure_mark(tooltip=None)
+
+            st.altair_chart(combined_chart, use_container_width=True)

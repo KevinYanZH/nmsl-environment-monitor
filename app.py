@@ -1,20 +1,18 @@
 import os
 import re
 
+import requests
+
 import pandas as pd
 import streamlit as st
 import altair as alt
-import requests
 
 try:
     from streamlit_autorefresh import st_autorefresh
 except ImportError:
     st_autorefresh = None
 
-
 BASE_URL = "https://api.sensorpush.com/api/v1"
-DEFAULT_LOCAL_TIMEZONE = "America/Toronto"
-DEFAULT_SAMPLE_LIMIT = 500
 
 # ---------------------------------------------------------------------------
 # Lab limits
@@ -800,26 +798,35 @@ else:
         """, unsafe_allow_html=True
     )
 
-def get_secret(name, default=None):
-    """Read from Streamlit secrets first, then environment variables."""
+def get_config_value(name, default=None):
+    """Read config from Streamlit Secrets first, then environment variables."""
     try:
-        if name in st.secrets:
-            return st.secrets[name]
+        return st.secrets.get(name, os.environ.get(name, default))
     except Exception:
-        pass
-    return os.environ.get(name, default)
+        return os.environ.get(name, default)
+
+
+LOCAL_TIMEZONE = get_config_value("LOCAL_TIMEZONE", "America/Toronto")
+SENSORPUSH_EMAIL = get_config_value("SENSORPUSH_EMAIL")
+SENSORPUSH_PASSWORD = get_config_value("SENSORPUSH_PASSWORD")
+SENSORPUSH_SAMPLE_LIMIT = int(get_config_value("SENSORPUSH_SAMPLE_LIMIT", "500"))
 
 
 def fahrenheit_to_celsius(temp_f):
     return (temp_f - 32) * 5 / 9
 
 
-@st.cache_data(ttl=20 * 60, show_spinner=False)
-def get_access_token(email, password):
+def get_access_token():
+    if not SENSORPUSH_EMAIL or not SENSORPUSH_PASSWORD:
+        raise RuntimeError(
+            "Missing SensorPush credentials. Add SENSORPUSH_EMAIL and "
+            "SENSORPUSH_PASSWORD in Streamlit Cloud Secrets."
+        )
+
     authorize_response = requests.post(
         f"{BASE_URL}/oauth/authorize",
         headers={"accept": "application/json", "Content-Type": "application/json"},
-        json={"email": email, "password": password},
+        json={"email": SENSORPUSH_EMAIL, "password": SENSORPUSH_PASSWORD},
         timeout=30,
     )
     authorize_response.raise_for_status()
@@ -835,11 +842,8 @@ def get_access_token(email, password):
     return access_response.json()["accesstoken"]
 
 
-@st.cache_data(ttl=60, show_spinner=False)
-def fetch_sensorpush_payload(email, password, sample_limit):
-    access_token = get_access_token(email, password)
-
-    sensors_response = requests.post(
+def get_sensors(access_token):
+    response = requests.post(
         f"{BASE_URL}/devices/sensors",
         headers={
             "accept": "application/json",
@@ -849,50 +853,41 @@ def fetch_sensorpush_payload(email, password, sample_limit):
         json={},
         timeout=30,
     )
-    sensors_response.raise_for_status()
-    sensors = sensors_response.json()
+    response.raise_for_status()
+    return response.json()
 
-    samples_response = requests.post(
+
+def get_samples(access_token, limit):
+    response = requests.post(
         f"{BASE_URL}/samples",
         headers={
             "accept": "application/json",
             "Authorization": access_token,
             "Content-Type": "application/json",
         },
-        json={"limit": int(sample_limit)},
-        timeout=30,
+        json={"limit": int(limit)},
+        timeout=45,
     )
-    samples_response.raise_for_status()
-    samples = samples_response.json()
-
-    return sensors, samples
+    response.raise_for_status()
+    return response.json()
 
 
+@st.cache_data(ttl=55, show_spinner=False)
 def load_data():
-    email = get_secret("SENSORPUSH_EMAIL")
-    password = get_secret("SENSORPUSH_PASSWORD")
-    local_timezone = get_secret("LOCAL_TIMEZONE", DEFAULT_LOCAL_TIMEZONE)
-    sample_limit = int(get_secret("SENSORPUSH_SAMPLE_LIMIT", DEFAULT_SAMPLE_LIMIT))
+    """Fetch recent SensorPush readings directly from the SensorPush API.
 
-    if not email or not password:
-        st.error("SensorPush credentials are missing.")
-        st.info(
-            "In Streamlit Cloud, open App settings → Secrets and add "
-            'SENSORPUSH_EMAIL, SENSORPUSH_PASSWORD, and LOCAL_TIMEZONE = "America/Toronto".'
-        )
-        st.stop()
-
-    sensors, samples = fetch_sensorpush_payload(email, password, sample_limit)
-    sensor_data = samples.get("sensors", {})
+    This cloud version does not use config.py, collector.py, or sensorpush.db.
+    Credentials must be stored in Streamlit Cloud Secrets.
+    """
+    access_token = get_access_token()
+    sensors = get_sensors(access_token)
+    samples = get_samples(access_token, SENSORPUSH_SAMPLE_LIMIT)
 
     rows = []
-    for sensor_id, readings in sensor_data.items():
-        if not readings:
-            continue
-
+    for sensor_id, readings in samples.get("sensors", {}).items():
         sensor_name = sensors.get(sensor_id, {}).get("name", sensor_id)
 
-        for reading in readings:
+        for reading in readings or []:
             observed_time = reading.get("observed")
             temperature_f = reading.get("temperature")
             humidity = reading.get("humidity")
@@ -919,12 +914,14 @@ def load_data():
 
     df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
     df = df.dropna(subset=["timestamp"])
-    df["timestamp"] = df["timestamp"].dt.tz_convert(local_timezone)
-    df = df.drop_duplicates(subset=["sensor_id", "timestamp"]).sort_values("timestamp")
+    if df.empty:
+        return df
 
+    df["timestamp"] = df["timestamp"].dt.tz_convert(LOCAL_TIMEZONE)
     df["timestamp_display"] = df["timestamp"].dt.strftime("%m/%d %I:%M %p")
     df["pressure_mb"] = df["barometric_pressure_inhg"] * 33.8639
-    return df
+
+    return df.sort_values("timestamp").reset_index(drop=True)
 
 def is_normal(temp, humidity):
     return (TEMP_MIN <= temp <= TEMP_MAX) and (HUMIDITY_MIN <= humidity <= HUMIDITY_MAX)
@@ -1524,7 +1521,7 @@ except Exception as e:
     st.stop()
 
 if df.empty:
-    st.warning("No SensorPush readings were returned. Check the SensorPush account, sensors, gateway connection, and sample limit.")
+    st.warning("No readings returned from SensorPush yet.")
     st.stop()
 
 newest = df.iloc[-1]

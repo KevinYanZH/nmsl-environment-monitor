@@ -1139,42 +1139,34 @@ def render_graph_sensor_header(row):
     """
 
 def graph_window_bounds(max_timestamp, range_label, min_timestamp=None):
-    """Return graph window start/end for H/D/W/M/Y.
+    """Return fixed SensorPush-style graph window start/end for H/D/W/M/Y.
 
-    Use the normal required window when enough history exists:
-      H = last 1 hour
-      D = last 1 day
-      W = last 7 days
-      M = last 30 days
-      Y = last 365 days
+    The x-axis window stays fixed for each selected range, even if the app has
+    less fetched data than the full range. This means:
+      H = exactly last 1 hour to now
+      D = exactly last 1 day to now
+      W = exactly last 7 days to now
+      M = exactly last 30 days to now
+      Y = exactly last 365 days to now
 
-    If the fetched SensorPush history does not go back far enough for that
-    window, show all fetched data instead of showing an empty/partial leading
-    range. This keeps the page fast while still displaying all available data
-    when the sensors are newly set up or the API sample limit is smaller than
-    the selected range.
+    If there is not enough data to fill the window, the available data appears
+    only in the correct position near the right side of the chart instead of
+    stretching to fill the whole graph.
     """
     end = max_timestamp
 
     if range_label == "H":
-        required_start = end - pd.Timedelta(hours=1)
+        start = end - pd.Timedelta(hours=1)
     elif range_label == "D":
-        required_start = end - pd.Timedelta(days=1)
+        start = end - pd.Timedelta(days=1)
     elif range_label == "W":
-        required_start = end - pd.Timedelta(days=7)
+        start = end - pd.Timedelta(days=7)
     elif range_label == "M":
-        required_start = end - pd.Timedelta(days=30)
+        start = end - pd.Timedelta(days=30)
     elif range_label == "Y":
-        required_start = end - pd.Timedelta(days=365)
+        start = end - pd.Timedelta(days=365)
     else:
-        required_start = end - pd.Timedelta(days=1)
-
-    if min_timestamp is None:
-        start = required_start
-    else:
-        # If we have enough data, use the required fixed window.
-        # If not, use all available fetched data.
-        start = max(required_start, min_timestamp)
+        start = end - pd.Timedelta(days=1)
 
     return start, end
 

@@ -1141,19 +1141,40 @@ def render_graph_sensor_header(row):
 def graph_window_bounds(max_timestamp, range_label, min_timestamp=None):
     """Return graph window start/end for H/D/W/M/Y.
 
-    H stays as the most recent hour.
-    D/W/M/Y show all fetched history from the earliest available reading,
-    so the graph can display data from when the sensors were first set up.
+    Use the normal required window when enough history exists:
+      H = last 1 hour
+      D = last 1 day
+      W = last 7 days
+      M = last 30 days
+      Y = last 365 days
+
+    If the fetched SensorPush history does not go back far enough for that
+    window, show all fetched data instead of showing an empty/partial leading
+    range. This keeps the page fast while still displaying all available data
+    when the sensors are newly set up or the API sample limit is smaller than
+    the selected range.
     """
     end = max_timestamp
 
     if range_label == "H":
-        start = end - pd.Timedelta(hours=1)
+        required_start = end - pd.Timedelta(hours=1)
+    elif range_label == "D":
+        required_start = end - pd.Timedelta(days=1)
+    elif range_label == "W":
+        required_start = end - pd.Timedelta(days=7)
+    elif range_label == "M":
+        required_start = end - pd.Timedelta(days=30)
+    elif range_label == "Y":
+        required_start = end - pd.Timedelta(days=365)
     else:
-        # For D/W/M/Y, show all available historical data instead of cutting to
-        # only the last day/week/month/year. The amount of history available still
-        # depends on how many samples the cloud app fetches from SensorPush.
-        start = min_timestamp if min_timestamp is not None else end - pd.Timedelta(days=1)
+        required_start = end - pd.Timedelta(days=1)
+
+    if min_timestamp is None:
+        start = required_start
+    else:
+        # If we have enough data, use the required fixed window.
+        # If not, use all available fetched data.
+        start = max(required_start, min_timestamp)
 
     return start, end
 

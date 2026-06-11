@@ -1295,8 +1295,26 @@ def make_sensorpush_chart(view, metric_col, title, unit_suffix="", height=160, r
         y=alt.Y("y:Q", scale=y_scale),
     )
 
-    label_text = f"{mean_value:.1f}{unit_suffix}"
-    label = alt.Chart(pd.DataFrame({"x": [x_start], "y": [mean_value], "label": [label_text]})).mark_text(
+    # Left-side reference numbers. The old chart only labeled the dotted mean line,
+    # which made it hard to judge the scale. Add top/middle/bottom labels in the
+    # white gutter just left of the gray plot area, while keeping the dotted mean
+    # line as the middle reference.
+    y_span_for_refs = max(float(y_domain[1] - y_domain[0]), 1e-9)
+    y_ref_top = float(y_domain[1] - y_span_for_refs * 0.08)
+    y_ref_mid = float(mean_value)
+    y_ref_bottom = float(y_domain[0] + y_span_for_refs * 0.08)
+
+    if unit_suffix == "in":
+        ref_label_fn = lambda v: f"{v:.2f}{unit_suffix}"
+    else:
+        ref_label_fn = lambda v: f"{v:.1f}{unit_suffix}"
+
+    ref_labels_df = pd.DataFrame({
+        "x": [x_start, x_start, x_start],
+        "y": [y_ref_top, y_ref_mid, y_ref_bottom],
+        "label": [ref_label_fn(y_ref_top), ref_label_fn(y_ref_mid), ref_label_fn(y_ref_bottom)],
+    })
+    ref_labels = alt.Chart(ref_labels_df).mark_text(
         align="right", baseline="middle", dx=-10, fontSize=11, color="#30355e", clip=False
     ).encode(
         x=alt.X("x:T", scale=x_scale),
@@ -1417,7 +1435,7 @@ def make_sensorpush_chart(view, metric_col, title, unit_suffix="", height=160, r
     ).encode(x=xt, y=yq, text="_hover_label:N", tooltip=alt.value(None))
 
     layered = alt.layer(
-        plot_bg, mean_line, line, label, selectors, rule, points,
+        plot_bg, mean_line, line, ref_labels, selectors, rule, points,
         bg_right, text_right, bg_left, text_left
     ).properties(
         height=height,

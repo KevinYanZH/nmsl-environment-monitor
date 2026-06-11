@@ -809,7 +809,7 @@ def get_config_value(name, default=None):
 LOCAL_TIMEZONE = get_config_value("LOCAL_TIMEZONE", "America/Toronto")
 SENSORPUSH_EMAIL = get_config_value("SENSORPUSH_EMAIL")
 SENSORPUSH_PASSWORD = get_config_value("SENSORPUSH_PASSWORD")
-SENSORPUSH_SAMPLE_LIMIT = int(get_config_value("SENSORPUSH_SAMPLE_LIMIT", "500"))
+SENSORPUSH_SAMPLE_LIMIT = int(get_config_value("SENSORPUSH_SAMPLE_LIMIT", "5000"))
 
 
 def fahrenheit_to_celsius(temp_f):
@@ -1138,22 +1138,23 @@ def render_graph_sensor_header(row):
     </div>
     """
 
-def graph_window_bounds(max_timestamp, range_label):
-    """Return fixed SensorPush-style graph window start/end for H/D/W/M/Y."""
-    if range_label == "H":
-        delta = pd.Timedelta(hours=1)
-    elif range_label == "D":
-        delta = pd.Timedelta(days=1)
-    elif range_label == "W":
-        delta = pd.Timedelta(days=7)
-    elif range_label == "M":
-        delta = pd.Timedelta(days=30)
-    elif range_label == "Y":
-        delta = pd.Timedelta(days=365)
-    else:
-        delta = pd.Timedelta(days=1)
+def graph_window_bounds(max_timestamp, range_label, min_timestamp=None):
+    """Return graph window start/end for H/D/W/M/Y.
+
+    H stays as the most recent hour.
+    D/W/M/Y show all fetched history from the earliest available reading,
+    so the graph can display data from when the sensors were first set up.
+    """
     end = max_timestamp
-    start = end - delta
+
+    if range_label == "H":
+        start = end - pd.Timedelta(hours=1)
+    else:
+        # For D/W/M/Y, show all available historical data instead of cutting to
+        # only the last day/week/month/year. The amount of history available still
+        # depends on how many samples the cloud app fetches from SensorPush.
+        start = min_timestamp if min_timestamp is not None else end - pd.Timedelta(days=1)
+
     return start, end
 
 def graph_axis_format(range_label):
@@ -1761,7 +1762,7 @@ else:
             unsafe_allow_html=True,
         )
 
-        graph_start, graph_end = graph_window_bounds(df["timestamp"].max(), range_label)
+        graph_start, graph_end = graph_window_bounds(df["timestamp"].max(), range_label, df["timestamp"].min())
 
         view = df[df["sensor_name"].isin(chosen)].copy()
         if not view.empty:

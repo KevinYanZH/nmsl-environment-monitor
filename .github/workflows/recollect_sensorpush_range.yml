@@ -1,0 +1,47 @@
+name: Recollect SensorPush range
+
+on:
+  workflow_dispatch:
+    inputs:
+      start_date:
+        description: 'Start date/time in America/Toronto, e.g. 2026-06-13 or 2026-06-13T00:00:00'
+        required: true
+        default: '2026-06-13'
+      end_date:
+        description: 'End date/time in America/Toronto, e.g. 2026-06-16 or now'
+        required: true
+        default: 'now'
+      chunk_hours:
+        description: 'Hours per SensorPush request. Smaller is safer but slower.'
+        required: true
+        default: '12'
+      delete_existing:
+        description: 'Delete existing rows in this date range before recollecting? Use 1 or 0.'
+        required: true
+        default: '0'
+
+jobs:
+  recollect:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests psycopg2-binary python-dotenv
+      - name: Recollect SensorPush missing range
+        env:
+          SENSORPUSH_EMAIL: ${{ secrets.SENSORPUSH_EMAIL }}
+          SENSORPUSH_PASSWORD: ${{ secrets.SENSORPUSH_PASSWORD }}
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          LOCAL_TIMEZONE: America/Toronto
+          RECOLLECT_START: ${{ github.event.inputs.start_date }}
+          RECOLLECT_END: ${{ github.event.inputs.end_date }}
+          RECOLLECT_CHUNK_HOURS: ${{ github.event.inputs.chunk_hours }}
+          RECOLLECT_DELETE_EXISTING: ${{ github.event.inputs.delete_existing }}
+          RECOLLECT_LIMIT: '10000'
+          RECOLLECT_SLEEP_SECONDS: '65'
+        run: python recollect_range_supabase.py

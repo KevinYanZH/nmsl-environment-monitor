@@ -1024,8 +1024,12 @@ def prepare_dataframe(rows):
 
 @st.cache_data(ttl=55, show_spinner=False)
 def load_data(range_label="D"):
-    """Load only the selected range from Supabase plus the latest row per sensor."""
-    sync_latest_to_database()
+    """Load only the selected range from Supabase plus the latest row per sensor.
+
+    The background GitHub Actions collector now writes new readings into Supabase,
+    so the dashboard only reads the database. This keeps page loads fast and
+    avoids asking SensorPush directly every time someone opens or refreshes the app.
+    """
     setup_cloud_database()
 
     with db_connect() as conn:
@@ -1336,6 +1340,78 @@ def graph_axis_format(range_label):
         return "%m/%d", 6
     return "%b %Y", 6
 
+def downsample_for_plot(view, range_label):
+    """Reduce only the number of points sent to Altair/Vega.
+
+    Supabase still stores all raw historical readings. This function only thins the
+    dataframe used for browser plotting/hover so W/M/Y do not try to render tens of
+    thousands of points. H and D stay high-resolution.
+    """
+    if view.empty:
+        return view
+
+    # H/D are small enough to keep detailed. Larger windows are averaged by time.
+    freq_by_range = {
+        "H": None,
+        "D": None,
+        "W": "10min",
+        "M": "30min",
+        "Y": "6h",
+    }
+    freq = freq_by_range.get(range_label)
+
+    # Safety cap even for H/D, in case the database becomes denser later.
+    max_points_per_sensor = {
+        "H": 900,
+        "D": 1200,
+        "W": 1000,
+        "M": 1000,
+        "Y": 800,
+    }.get(range_label, 1000)
+
+    parts = []
+    numeric_cols = [c for c in view.columns if c not in {
+        "timestamp", "timestamp_display", "sensor_id", "sensor_name", "source",
+        "_hover_label", "_hover_anchor"
+    } and pd.api.types.is_numeric_dtype(view[c])]
+
+    for sensor_name, g in view.sort_values("timestamp").groupby("sensor_name", sort=False):
+        g = g.dropna(subset=["timestamp"]).copy()
+        if g.empty:
+            continue
+
+        if freq is not None:
+            resampled = (
+                g.set_index("timestamp")[numeric_cols]
+                .resample(freq)
+                .mean()
+                .dropna(how="all")
+                .reset_index()
+            )
+            resampled["sensor_name"] = sensor_name
+            if "sensor_id" in g.columns:
+                resampled["sensor_id"] = g["sensor_id"].iloc[0]
+            if "source" in g.columns:
+                resampled["source"] = g["source"].iloc[0]
+            g = resampled
+
+        # Hard cap by evenly selecting rows, preserving first/last.
+        if len(g) > max_points_per_sensor:
+            import numpy as np
+            idx = np.linspace(0, len(g) - 1, max_points_per_sensor).round().astype(int)
+            idx = sorted(set(idx))
+            g = g.iloc[idx].copy()
+
+        parts.append(g)
+
+    if not parts:
+        return view.iloc[0:0].copy()
+
+    out = pd.concat(parts, ignore_index=True).sort_values("timestamp")
+    out["timestamp_display"] = out["timestamp"].dt.strftime("%m/%d %I:%M %p")
+    return out.reset_index(drop=True)
+
+
 def make_sensorpush_chart(view, metric_col, title, unit_suffix="", height=160, range_label="D", x_start=None, x_end=None, capture_param=None, union_filter=None, show_x_axis=True, y_domain_override=None, label_metric_col=None, display_title=True):
     if view.empty:
         return None
@@ -1355,6 +1431,19 @@ def make_sensorpush_chart(view, metric_col, title, unit_suffix="", height=160, r
     else:
         value_text = view[label_metric_col].map(lambda v: f"{v:.1f}{unit_suffix}")
     view["_hover_label"] = time_text + ", " + value_text
+
+    # Send a much smaller dataframe to Altair for plotting and hover. The full
+    # dataframe is still used above/below for scale and mean calculations.
+    plot_view = downsample_for_plot(view, range_label)
+    if not plot_view.empty:
+        plot_time_text = plot_view["timestamp"].dt.strftime("%m/%d %I:%M %p").str.replace(" 0", " ", regex=False).str.lower()
+        if unit_suffix == "in":
+            plot_value_text = plot_view[label_metric_col].map(lambda v: f"{v:.2f}{unit_suffix}")
+        else:
+            plot_value_text = plot_view[label_metric_col].map(lambda v: f"{v:.1f}{unit_suffix}")
+        plot_view["_hover_label"] = plot_time_text + ", " + plot_value_text
+    else:
+        plot_view = view
 
     # Fixed chart height, dynamic y-scale from the currently visible data.
     # The plotted data should use almost the full gray graph area while still leaving
@@ -1428,7 +1517,7 @@ def make_sensorpush_chart(view, metric_col, title, unit_suffix="", height=160, r
         y2="y2:Q",
     )
 
-    line = alt.Chart(view).mark_line(strokeWidth=1.8, clip=True).encode(
+    line = alt.Chart(plot_view).mark_line(strokeWidth=1.8, clip=True).encode(
         x=alt.X("timestamp:T", title=None, scale=x_scale, axis=x_axis),
         y=alt.Y(f"{metric_col}:Q", title=None, scale=y_scale, axis=y_axis_hidden),
         color=alt.Color("sensor_name:N", title=None, scale=color_scale, legend=None),
@@ -1487,7 +1576,7 @@ def make_sensorpush_chart(view, metric_col, title, unit_suffix="", height=160, r
         if len(hover_index) == 0:
             hover_index = pd.DatetimeIndex(sorted(view["timestamp"].dropna().unique()))
     else:
-        hover_index = pd.DatetimeIndex(sorted(view["timestamp"].dropna().unique()))
+        hover_index = pd.DatetimeIndex(sorted(plot_view["timestamp"].dropna().unique()))
 
     anchor_times = pd.DataFrame({"_hover_anchor": hover_index})
 
@@ -1496,7 +1585,7 @@ def make_sensorpush_chart(view, metric_col, title, unit_suffix="", height=160, r
     if label_metric_col != metric_col:
         numeric_cols.append(label_metric_col)
 
-    for sensor_name, sensor_rows in view.sort_values("timestamp").groupby("sensor_name", sort=False):
+    for sensor_name, sensor_rows in plot_view.sort_values("timestamp").groupby("sensor_name", sort=False):
         sensor_numeric = (
             sensor_rows.set_index("timestamp")[numeric_cols]
             .groupby(level=0).mean()
@@ -1517,7 +1606,7 @@ def make_sensorpush_chart(view, metric_col, title, unit_suffix="", height=160, r
         interpolated["_hover_anchor"] = interpolated.index
         hover_parts.append(interpolated.reset_index(drop=True))
 
-    hover_view = pd.concat(hover_parts, ignore_index=True) if hover_parts else view.copy()
+    hover_view = pd.concat(hover_parts, ignore_index=True) if hover_parts else plot_view.copy()
     hover_view = hover_view.dropna(subset=[metric_col, "sensor_name", "_hover_anchor"])
 
     anchor_time_text = hover_view["_hover_anchor"].dt.strftime("%m/%d %I:%M %p").str.replace(" 0", " ", regex=False).str.lower()
@@ -1607,14 +1696,15 @@ def make_sensorpush_chart(view, metric_col, title, unit_suffix="", height=160, r
 
 
 def hover_freq_for_range(range_label):
+    # Coarser hover anchors greatly reduce browser-side Vega work.
     if range_label == "H":
-        return "15s"
+        return "30s"
     if range_label == "D":
-        return "2min"
+        return "5min"
     if range_label == "W":
-        return "20min"
+        return "30min"
     if range_label == "M":
-        return "2h"
+        return "3h"
     return "1D"
 
 
@@ -1851,7 +1941,7 @@ if tab == "STATUS":
 # ===========================================================================
 else:
     if st_autorefresh is not None:
-        st_autorefresh(interval=60 * 1000, key="sensorpush_graph_refresh")
+        st_autorefresh(interval=5 * 60 * 1000, key="sensorpush_graph_refresh")
 
     latest = df.groupby("sensor_name").tail(1).sort_values("sensor_name")
     sensor_options = sorted(df["sensor_name"].unique().tolist())
@@ -2005,7 +2095,7 @@ else:
                     name=f"sp_hover_{i}", nearest=True, on="pointerover",
                     fields=["_hover_anchor"], empty=False, clear="pointerout",
                 )
-                for i in range(6)
+                for i in range(3)
             ]
             union_filter = " || ".join(
                 f'((length(data("{p.name}_store")) > 0) && '
@@ -2014,21 +2104,18 @@ else:
             )
 
             # Fixed chart height, dynamic y-scale from the currently visible sensors.
-            # This keeps the gray graph boxes the same size while letting the actual lines
-            # expand vertically instead of looking flat.
-            temp_title = make_title_hover_band("TEMPERATURE", range_label=range_label, x_start=graph_start, x_end=graph_end, capture_param=hover_params[3], band_height=28)
-            humidity_title = make_title_hover_band("RELATIVE HUMIDITY", range_label=range_label, x_start=graph_start, x_end=graph_end, capture_param=hover_params[4], band_height=28)
-            pressure_title = make_title_hover_band("BAROMETRIC PRESSURE", range_label=range_label, x_start=graph_start, x_end=graph_end, capture_param=hover_params[5], band_height=28)
-
-            temp_chart = make_sensorpush_chart(temp_view, "temperature_display", "TEMPERATURE", temp_suffix, height=155, range_label=range_label, x_start=graph_start, x_end=graph_end, capture_param=hover_params[0], union_filter=union_filter, show_x_axis=False, display_title=False)
-            humidity_chart = make_sensorpush_chart(view, "humidity", "RELATIVE HUMIDITY", "%", height=155, range_label=range_label, x_start=graph_start, x_end=graph_end, capture_param=hover_params[1], union_filter=union_filter, show_x_axis=False, display_title=False)
-            pressure_chart = make_sensorpush_chart(pressure_view, "pressure_display_plot", "BAROMETRIC PRESSURE", pressure_suffix, height=155, range_label=range_label, x_start=graph_start, x_end=graph_end, capture_param=hover_params[2], union_filter=union_filter, show_x_axis=True, label_metric_col="pressure_display", display_title=False)
+            # The charts are downsampled internally for plotting, while the database keeps
+            # all raw historical rows. Removing the separate invisible title-hover bands
+            # also cuts a large amount of browser-side work.
+            temp_chart = make_sensorpush_chart(temp_view, "temperature_display", "TEMPERATURE", temp_suffix, height=155, range_label=range_label, x_start=graph_start, x_end=graph_end, capture_param=hover_params[0], union_filter=union_filter, show_x_axis=False, display_title=True)
+            humidity_chart = make_sensorpush_chart(view, "humidity", "RELATIVE HUMIDITY", "%", height=155, range_label=range_label, x_start=graph_start, x_end=graph_end, capture_param=hover_params[1], union_filter=union_filter, show_x_axis=False, display_title=True)
+            pressure_chart = make_sensorpush_chart(pressure_view, "pressure_display_plot", "BAROMETRIC PRESSURE", pressure_suffix, height=155, range_label=range_label, x_start=graph_start, x_end=graph_end, capture_param=hover_params[2], union_filter=union_filter, show_x_axis=True, label_metric_col="pressure_display", display_title=True)
 
             combined_chart = alt.vconcat(
-                temp_title, temp_chart,
-                humidity_title, humidity_chart,
-                pressure_title, pressure_chart,
-                spacing=0,
+                temp_chart,
+                humidity_chart,
+                pressure_chart,
+                spacing=22,
             ).resolve_scale(x="shared", color="shared").properties(
                 # The mean-label gutter is handled by the x-scale domain inside
                 # make_sensorpush_chart; keep outer padding small to avoid shifting

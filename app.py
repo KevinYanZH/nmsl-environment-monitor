@@ -2,6 +2,8 @@ import os
 import re
 
 import requests
+import psycopg2
+import psycopg2.extras
 
 import pandas as pd
 import streamlit as st
@@ -809,11 +811,57 @@ def get_config_value(name, default=None):
 LOCAL_TIMEZONE = get_config_value("LOCAL_TIMEZONE", "America/Toronto")
 SENSORPUSH_EMAIL = get_config_value("SENSORPUSH_EMAIL")
 SENSORPUSH_PASSWORD = get_config_value("SENSORPUSH_PASSWORD")
-SENSORPUSH_SAMPLE_LIMIT = int(get_config_value("SENSORPUSH_SAMPLE_LIMIT", "5000"))
+DATABASE_URL = get_config_value("DATABASE_URL")
+SENSORPUSH_POLL_LIMIT = int(get_config_value("SENSORPUSH_POLL_LIMIT", "200"))
 
 
 def fahrenheit_to_celsius(temp_f):
     return (temp_f - 32) * 5 / 9
+
+
+def normalize_database_url(url):
+    if not url:
+        raise RuntimeError(
+            "Missing DATABASE_URL. Add the Supabase Postgres connection string "
+            "in Streamlit Cloud Secrets."
+        )
+    url = str(url).strip()
+    if url.startswith("postgres://"):
+        url = "postgresql://" + url[len("postgres://"):]
+    if "sslmode=" not in url:
+        separator = "&" if "?" in url else "?"
+        url = f"{url}{separator}sslmode=require"
+    return url
+
+
+def db_connect():
+    return psycopg2.connect(normalize_database_url(DATABASE_URL))
+
+
+@st.cache_resource(show_spinner=False)
+def setup_cloud_database():
+    """Create the Supabase/Postgres readings table and indexes if needed."""
+    with db_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+            CREATE TABLE IF NOT EXISTS readings (
+                id BIGSERIAL PRIMARY KEY,
+                observed_at TIMESTAMPTZ NOT NULL,
+                sensor_id TEXT NOT NULL,
+                sensor_name TEXT NOT NULL,
+                temperature_c DOUBLE PRECISION,
+                humidity DOUBLE PRECISION,
+                barometric_pressure_inhg DOUBLE PRECISION,
+                voltage DOUBLE PRECISION,
+                source TEXT DEFAULT 'sensorpush_api',
+                stored_at TIMESTAMPTZ DEFAULT NOW(),
+                UNIQUE (sensor_id, observed_at)
+            )
+            """)
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_readings_observed_at ON readings (observed_at)")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_readings_sensor_observed ON readings (sensor_id, observed_at)")
+        conn.commit()
+    return True
 
 
 def get_access_token():
@@ -872,21 +920,10 @@ def get_samples(access_token, limit):
     return response.json()
 
 
-@st.cache_data(ttl=55, show_spinner=False)
-def load_data():
-    """Fetch recent SensorPush readings directly from the SensorPush API.
-
-    This cloud version does not use config.py, collector.py, or sensorpush.db.
-    Credentials must be stored in Streamlit Cloud Secrets.
-    """
-    access_token = get_access_token()
-    sensors = get_sensors(access_token)
-    samples = get_samples(access_token, SENSORPUSH_SAMPLE_LIMIT)
-
+def samples_to_rows(sensors, samples):
     rows = []
     for sensor_id, readings in samples.get("sensors", {}).items():
         sensor_name = sensors.get(sensor_id, {}).get("name", sensor_id)
-
         for reading in readings or []:
             observed_time = reading.get("observed")
             temperature_f = reading.get("temperature")
@@ -897,31 +934,150 @@ def load_data():
             if observed_time is None or temperature_f is None or humidity is None:
                 continue
 
-            rows.append({
-                "timestamp": observed_time,
-                "sensor_id": sensor_id,
-                "sensor_name": sensor_name,
-                "temperature_c": fahrenheit_to_celsius(float(temperature_f)),
-                "humidity": float(humidity) if humidity is not None else None,
-                "barometric_pressure_inhg": float(pressure) if pressure is not None else None,
-                "voltage": float(voltage) if voltage is not None else None,
-                "source": "sensorpush_api_cloud",
-            })
+            rows.append((
+                observed_time,
+                sensor_id,
+                sensor_name,
+                fahrenheit_to_celsius(float(temperature_f)),
+                float(humidity) if humidity is not None else None,
+                float(pressure) if pressure is not None else None,
+                float(voltage) if voltage is not None else None,
+                "sensorpush_api_cloud",
+            ))
+    return rows
 
+
+def insert_rows(rows):
+    if not rows:
+        return 0
+    setup_cloud_database()
+    with db_connect() as conn:
+        with conn.cursor() as cur:
+            psycopg2.extras.execute_values(
+                cur,
+                """
+                INSERT INTO readings (
+                    observed_at, sensor_id, sensor_name,
+                    temperature_c, humidity, barometric_pressure_inhg,
+                    voltage, source
+                ) VALUES %s
+                ON CONFLICT (sensor_id, observed_at) DO UPDATE SET
+                    sensor_name = EXCLUDED.sensor_name,
+                    temperature_c = EXCLUDED.temperature_c,
+                    humidity = EXCLUDED.humidity,
+                    barometric_pressure_inhg = EXCLUDED.barometric_pressure_inhg,
+                    voltage = EXCLUDED.voltage,
+                    source = EXCLUDED.source
+                """,
+                rows,
+                page_size=1000,
+            )
+            inserted_or_updated = cur.rowcount
+        conn.commit()
+    return inserted_or_updated
+
+
+@st.cache_data(ttl=55, show_spinner=False)
+def sync_latest_to_database():
+    """Fetch only recent SensorPush samples, then store new rows in Supabase.
+
+    This is the key difference from the direct cloud version: the app does NOT ask
+    SensorPush for all historical data every refresh. Historical graph data comes
+    from Supabase.
+    """
+    setup_cloud_database()
+    access_token = get_access_token()
+    sensors = get_sensors(access_token)
+    samples = get_samples(access_token, SENSORPUSH_POLL_LIMIT)
+    rows = samples_to_rows(sensors, samples)
+    changed = insert_rows(rows)
+    return {"returned": len(rows), "inserted_or_updated": changed}
+
+
+def timedelta_for_range(range_label):
+    if range_label == "H":
+        return pd.Timedelta(hours=1)
+    if range_label == "D":
+        return pd.Timedelta(days=1)
+    if range_label == "W":
+        return pd.Timedelta(days=7)
+    if range_label == "M":
+        return pd.Timedelta(days=30)
+    if range_label == "Y":
+        return pd.Timedelta(days=365)
+    return pd.Timedelta(days=1)
+
+
+def prepare_dataframe(rows):
     df = pd.DataFrame(rows)
     if df.empty:
         return df
-
     df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
     df = df.dropna(subset=["timestamp"])
     if df.empty:
         return df
-
     df["timestamp"] = df["timestamp"].dt.tz_convert(LOCAL_TIMEZONE)
     df["timestamp_display"] = df["timestamp"].dt.strftime("%m/%d %I:%M %p")
     df["pressure_mb"] = df["barometric_pressure_inhg"] * 33.8639
-
     return df.sort_values("timestamp").reset_index(drop=True)
+
+
+@st.cache_data(ttl=55, show_spinner=False)
+def load_data(range_label="D"):
+    """Load only the selected range from Supabase plus the latest row per sensor."""
+    sync_latest_to_database()
+    setup_cloud_database()
+
+    with db_connect() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute("SELECT MAX(observed_at) AS max_time FROM readings")
+            max_row = cur.fetchone()
+            max_time = max_row["max_time"] if max_row else None
+
+            if max_time is None:
+                return pd.DataFrame()
+
+            start_time = max_time - timedelta_for_range(range_label)
+            cur.execute(
+                """
+                WITH latest AS (
+                    SELECT DISTINCT ON (sensor_id)
+                        observed_at AS timestamp,
+                        sensor_id,
+                        sensor_name,
+                        temperature_c,
+                        humidity,
+                        barometric_pressure_inhg,
+                        voltage,
+                        source
+                    FROM readings
+                    ORDER BY sensor_id, observed_at DESC
+                ),
+                range_rows AS (
+                    SELECT
+                        observed_at AS timestamp,
+                        sensor_id,
+                        sensor_name,
+                        temperature_c,
+                        humidity,
+                        barometric_pressure_inhg,
+                        voltage,
+                        source
+                    FROM readings
+                    WHERE observed_at >= %s AND observed_at <= %s
+                )
+                SELECT DISTINCT * FROM (
+                    SELECT * FROM range_rows
+                    UNION ALL
+                    SELECT * FROM latest
+                ) AS combined
+                ORDER BY timestamp
+                """,
+                (start_time, max_time),
+            )
+            rows = cur.fetchall()
+
+    return prepare_dataframe(rows)
 
 def is_normal(temp, humidity):
     return (TEMP_MIN <= temp <= TEMP_MAX) and (HUMIDITY_MIN <= humidity <= HUMIDITY_MAX)
@@ -1546,7 +1702,7 @@ def make_title_hover_band(title, range_label="D", x_start=None, x_end=None, capt
     return alt.layer(title_mark, hover_rects).properties(height=band_height, width="container")
 
 try:
-    df = load_data()
+    df = load_data(st.session_state.get("graph_range", "D"))
 except Exception as e:
     st.error("Could not load SensorPush data.")
     st.exception(e)

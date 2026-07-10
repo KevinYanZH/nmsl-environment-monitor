@@ -707,6 +707,29 @@ st.markdown(
         margin-top:4px;
     }
 
+
+
+    /* Button-based nav fallback for Streamlit Cloud stability */
+    .st-key-nav_status button,
+    .st-key-nav_graph button {
+        background: transparent !important;
+        border: none !important;
+        box-shadow: none !important;
+        padding: 0px 10px 0px 0px !important;
+        min-height: 24px !important;
+    }
+    .st-key-nav_status button p,
+    .st-key-nav_graph button p {
+        color: #060b3f !important;
+        font-weight: 900 !important;
+        font-size: 14px !important;
+        letter-spacing: 0.4px !important;
+    }
+    .st-key-nav_status button:hover p,
+    .st-key-nav_graph button:hover p {
+        color: #52b83f !important;
+    }
+
     #MainMenu {visibility: hidden;}
     footer {visibility: hidden;}
     header {visibility: hidden;}
@@ -724,6 +747,8 @@ if "show_settings" not in st.session_state:
     st.session_state["show_settings"] = False
 if "graph_range" not in st.session_state:
     st.session_state["graph_range"] = "D"
+if "main_nav" not in st.session_state:
+    st.session_state["main_nav"] = "STATUS"
 
 if st.session_state["theme"] == "dark":
     st.markdown(
@@ -1866,17 +1891,15 @@ def render_settings_panel():
             with row1_label:
                 st.markdown('<div class="settings-row-label">Temperature unit</div>', unsafe_allow_html=True)
             with row1_control:
-                new_temp = st.radio(
-                    "",
-                    ["°F", "°C"],
-                    index=["°F", "°C"].index(st.session_state["temp_unit"]),
-                    horizontal=True,
-                    label_visibility="collapsed",
-                    key="temp_unit_radio",
-                )
-                if new_temp != st.session_state["temp_unit"]:
-                    st.session_state["temp_unit"] = new_temp
-                    st.rerun()
+                unit_cols = st.columns(2)
+                with unit_cols[0]:
+                    if st.button("°F", key="temp_unit_btn_f"):
+                        st.session_state["temp_unit"] = "°F"
+                        st.rerun()
+                with unit_cols[1]:
+                    if st.button("°C", key="temp_unit_btn_c"):
+                        st.session_state["temp_unit"] = "°C"
+                        st.rerun()
 
         st.markdown('<div class="settings-divider"></div>', unsafe_allow_html=True)
 
@@ -1885,17 +1908,15 @@ def render_settings_panel():
             with row2_label:
                 st.markdown('<div class="settings-row-label">Barometric pressure unit</div>', unsafe_allow_html=True)
             with row2_control:
-                new_pres = st.radio(
-                    "",
-                    ["mb", "in"],
-                    index=["mb", "in"].index(st.session_state["pressure_unit"]),
-                    horizontal=True,
-                    label_visibility="collapsed",
-                    key="pressure_unit_radio",
-                )
-                if new_pres != st.session_state["pressure_unit"]:
-                    st.session_state["pressure_unit"] = new_pres
-                    st.rerun()
+                unit_cols = st.columns(2)
+                with unit_cols[0]:
+                    if st.button("mb", key="pressure_unit_btn_mb"):
+                        st.session_state["pressure_unit"] = "mb"
+                        st.rerun()
+                with unit_cols[1]:
+                    if st.button("in", key="pressure_unit_btn_in"):
+                        st.session_state["pressure_unit"] = "in"
+                        st.rerun()
 
         st.markdown('<div class="settings-divider"></div>', unsafe_allow_html=True)
 
@@ -1903,7 +1924,24 @@ if st.session_state["show_settings"]:
     render_settings_panel()
     st.stop()
 
-tab = st.radio("nav", ["STATUS", "GRAPH"], horizontal=True, label_visibility="collapsed", key="main_nav")
+nav_cols = st.columns([0.7, 0.7, 8.6], vertical_alignment="center")
+with nav_cols[0]:
+    if st.button("● STATUS", key="nav_status"):
+        st.session_state["main_nav"] = "STATUS"
+        st.rerun()
+with nav_cols[1]:
+    if st.button("● GRAPH", key="nav_graph"):
+        st.session_state["main_nav"] = "GRAPH"
+        st.rerun()
+
+tab = st.session_state.get("main_nav", "STATUS")
+active_nav_css = """
+<style>
+.st-key-nav_status button p { color: __STATUS_COLOR__ !important; }
+.st-key-nav_graph button p { color: __GRAPH_COLOR__ !important; }
+</style>
+""".replace("__STATUS_COLOR__", "#52b83f" if tab == "STATUS" else "#060b3f").replace("__GRAPH_COLOR__", "#52b83f" if tab == "GRAPH" else "#060b3f")
+st.markdown(active_nav_css, unsafe_allow_html=True)
 st.markdown('<div class="header-divider" style="margin-top:0px;margin-bottom:0px;"></div>', unsafe_allow_html=True)
 
 # ===========================================================================

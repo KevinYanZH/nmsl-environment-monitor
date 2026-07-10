@@ -9,9 +9,6 @@ import pandas as pd
 import streamlit as st
 import altair as alt
 
-# Avoid Streamlit/Altair crashing when a range temporarily has many rows.
-alt.data_transformers.disable_max_rows()
-
 try:
     from streamlit_autorefresh import st_autorefresh
 except ImportError:
@@ -707,29 +704,6 @@ st.markdown(
         margin-top:4px;
     }
 
-
-
-    /* Button-based nav fallback for Streamlit Cloud stability */
-    .st-key-nav_status button,
-    .st-key-nav_graph button {
-        background: transparent !important;
-        border: none !important;
-        box-shadow: none !important;
-        padding: 0px 10px 0px 0px !important;
-        min-height: 24px !important;
-    }
-    .st-key-nav_status button p,
-    .st-key-nav_graph button p {
-        color: #060b3f !important;
-        font-weight: 900 !important;
-        font-size: 14px !important;
-        letter-spacing: 0.4px !important;
-    }
-    .st-key-nav_status button:hover p,
-    .st-key-nav_graph button:hover p {
-        color: #52b83f !important;
-    }
-
     #MainMenu {visibility: hidden;}
     footer {visibility: hidden;}
     header {visibility: hidden;}
@@ -747,8 +721,6 @@ if "show_settings" not in st.session_state:
     st.session_state["show_settings"] = False
 if "graph_range" not in st.session_state:
     st.session_state["graph_range"] = "D"
-if "main_nav" not in st.session_state:
-    st.session_state["main_nav"] = "STATUS"
 
 if st.session_state["theme"] == "dark":
     st.markdown(
@@ -1052,23 +1024,13 @@ def prepare_dataframe(rows):
 
 @st.cache_data(ttl=55, show_spinner=False)
 def load_data(range_label="D"):
-    """Load the selected range from Supabase with SQL-side aggregation.
+    """Load only the selected range from Supabase plus the latest row per sensor.
 
-    Important: Supabase still stores every raw reading. This function only reduces
-    the number of rows sent to Streamlit/Altair for display so D/W/M/Y do not crash
-    or become very slow in the browser.
+    The background GitHub Actions collector now writes new readings into Supabase,
+    so the dashboard only reads the database. This keeps page loads fast and
+    avoids asking SensorPush directly every time someone opens or refreshes the app.
     """
     setup_cloud_database()
-
-    # Keep H close to raw, but aggregate longer windows before they reach Streamlit.
-    bucket_by_range = {
-        "H": "30 seconds",
-        "D": "2 minutes",
-        "W": "15 minutes",
-        "M": "1 hour",
-        "Y": "6 hours",
-    }
-    bucket = bucket_by_range.get(range_label, "2 minutes")
 
     with db_connect() as conn:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
@@ -1080,7 +1042,6 @@ def load_data(range_label="D"):
                 return pd.DataFrame()
 
             start_time = max_time - timedelta_for_range(range_label)
-
             cur.execute(
                 """
                 WITH latest AS (
@@ -1094,33 +1055,29 @@ def load_data(range_label="D"):
                         voltage,
                         source
                     FROM readings
-                    WHERE observed_at IS NOT NULL
                     ORDER BY sensor_id, observed_at DESC
                 ),
-                bucketed AS (
+                range_rows AS (
                     SELECT
-                        date_bin(%s::interval, observed_at, '2000-01-01 00:00:00+00'::timestamptz) AS timestamp,
+                        observed_at AS timestamp,
                         sensor_id,
-                        max(sensor_name) AS sensor_name,
-                        avg(temperature_c) AS temperature_c,
-                        avg(humidity) AS humidity,
-                        avg(barometric_pressure_inhg) AS barometric_pressure_inhg,
-                        avg(voltage) AS voltage,
-                        max(source) AS source
+                        sensor_name,
+                        temperature_c,
+                        humidity,
+                        barometric_pressure_inhg,
+                        voltage,
+                        source
                     FROM readings
-                    WHERE observed_at >= %s
-                      AND observed_at <= %s
-                      AND observed_at IS NOT NULL
-                    GROUP BY sensor_id, date_bin(%s::interval, observed_at, '2000-01-01 00:00:00+00'::timestamptz)
+                    WHERE observed_at >= %s AND observed_at <= %s
                 )
                 SELECT DISTINCT * FROM (
-                    SELECT * FROM bucketed
+                    SELECT * FROM range_rows
                     UNION ALL
                     SELECT * FROM latest
                 ) AS combined
                 ORDER BY timestamp
                 """,
-                (bucket, start_time, max_time, bucket),
+                (start_time, max_time),
             )
             rows = cur.fetchall()
 
@@ -1886,37 +1843,41 @@ def render_settings_panel():
 
         st.markdown('<div class="settings-divider"></div>', unsafe_allow_html=True)
 
-        with st.container():
+        with st.container(key="settings_temp_row"):
             row1_label, row1_control = st.columns([4, 1.15], vertical_alignment="center")
             with row1_label:
                 st.markdown('<div class="settings-row-label">Temperature unit</div>', unsafe_allow_html=True)
             with row1_control:
-                unit_cols = st.columns(2)
-                with unit_cols[0]:
-                    if st.button("°F", key="temp_unit_btn_f"):
-                        st.session_state["temp_unit"] = "°F"
-                        st.rerun()
-                with unit_cols[1]:
-                    if st.button("°C", key="temp_unit_btn_c"):
-                        st.session_state["temp_unit"] = "°C"
-                        st.rerun()
+                new_temp = st.radio(
+                    "",
+                    ["°F", "°C"],
+                    index=["°F", "°C"].index(st.session_state["temp_unit"]),
+                    horizontal=True,
+                    label_visibility="collapsed",
+                    key="temp_unit_radio",
+                )
+                if new_temp != st.session_state["temp_unit"]:
+                    st.session_state["temp_unit"] = new_temp
+                    st.rerun()
 
         st.markdown('<div class="settings-divider"></div>', unsafe_allow_html=True)
 
-        with st.container():
+        with st.container(key="settings_pressure_row"):
             row2_label, row2_control = st.columns([4, 1.15], vertical_alignment="center")
             with row2_label:
                 st.markdown('<div class="settings-row-label">Barometric pressure unit</div>', unsafe_allow_html=True)
             with row2_control:
-                unit_cols = st.columns(2)
-                with unit_cols[0]:
-                    if st.button("mb", key="pressure_unit_btn_mb"):
-                        st.session_state["pressure_unit"] = "mb"
-                        st.rerun()
-                with unit_cols[1]:
-                    if st.button("in", key="pressure_unit_btn_in"):
-                        st.session_state["pressure_unit"] = "in"
-                        st.rerun()
+                new_pres = st.radio(
+                    "",
+                    ["mb", "in"],
+                    index=["mb", "in"].index(st.session_state["pressure_unit"]),
+                    horizontal=True,
+                    label_visibility="collapsed",
+                    key="pressure_unit_radio",
+                )
+                if new_pres != st.session_state["pressure_unit"]:
+                    st.session_state["pressure_unit"] = new_pres
+                    st.rerun()
 
         st.markdown('<div class="settings-divider"></div>', unsafe_allow_html=True)
 
@@ -1924,24 +1885,7 @@ if st.session_state["show_settings"]:
     render_settings_panel()
     st.stop()
 
-nav_cols = st.columns([0.7, 0.7, 8.6], vertical_alignment="center")
-with nav_cols[0]:
-    if st.button("● STATUS", key="nav_status"):
-        st.session_state["main_nav"] = "STATUS"
-        st.rerun()
-with nav_cols[1]:
-    if st.button("● GRAPH", key="nav_graph"):
-        st.session_state["main_nav"] = "GRAPH"
-        st.rerun()
-
-tab = st.session_state.get("main_nav", "STATUS")
-active_nav_css = """
-<style>
-.st-key-nav_status button p { color: __STATUS_COLOR__ !important; }
-.st-key-nav_graph button p { color: __GRAPH_COLOR__ !important; }
-</style>
-""".replace("__STATUS_COLOR__", "#52b83f" if tab == "STATUS" else "#060b3f").replace("__GRAPH_COLOR__", "#52b83f" if tab == "GRAPH" else "#060b3f")
-st.markdown(active_nav_css, unsafe_allow_html=True)
+tab = st.radio("nav", ["STATUS", "GRAPH"], horizontal=True, label_visibility="collapsed", key="main_nav")
 st.markdown('<div class="header-divider" style="margin-top:0px;margin-bottom:0px;"></div>', unsafe_allow_html=True)
 
 # ===========================================================================
@@ -2030,7 +1974,7 @@ else:
             safe = safe_key(name)
             is_on = st.session_state.get(f"graph_show_{name}", True)
 
-            with st.container():
+            with st.container(key=f"graph_card_wrap_{safe}"):
                 head_cols = st.columns([0.76, 0.24], vertical_alignment="center")
                 with head_cols[0]:
                     st.markdown(render_graph_sensor_header(row), unsafe_allow_html=True)

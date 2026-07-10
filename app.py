@@ -2,8 +2,6 @@ import os
 import re
 
 import requests
-import psycopg2
-import psycopg2.extras
 
 import pandas as pd
 import streamlit as st
@@ -722,17 +720,6 @@ if "show_settings" not in st.session_state:
 if "graph_range" not in st.session_state:
     st.session_state["graph_range"] = "D"
 
-# Defensive defaults for widgets. Streamlit Cloud can keep browser widget state
-# across hot-reloads; these defaults prevent missing-key crashes after redeploys.
-for _key, _default in {
-    "current_tab": "STATUS",
-    "gw_filter": "",
-    "sensor_filter": "",
-    "graph_sensor_filter": "",
-}.items():
-    if _key not in st.session_state:
-        st.session_state[_key] = _default
-
 if st.session_state["theme"] == "dark":
     st.markdown(
         """
@@ -822,57 +809,11 @@ def get_config_value(name, default=None):
 LOCAL_TIMEZONE = get_config_value("LOCAL_TIMEZONE", "America/Toronto")
 SENSORPUSH_EMAIL = get_config_value("SENSORPUSH_EMAIL")
 SENSORPUSH_PASSWORD = get_config_value("SENSORPUSH_PASSWORD")
-DATABASE_URL = get_config_value("DATABASE_URL")
-SENSORPUSH_POLL_LIMIT = int(get_config_value("SENSORPUSH_POLL_LIMIT", "200"))
+SENSORPUSH_SAMPLE_LIMIT = int(get_config_value("SENSORPUSH_SAMPLE_LIMIT", "5000"))
 
 
 def fahrenheit_to_celsius(temp_f):
     return (temp_f - 32) * 5 / 9
-
-
-def normalize_database_url(url):
-    if not url:
-        raise RuntimeError(
-            "Missing DATABASE_URL. Add the Supabase Postgres connection string "
-            "in Streamlit Cloud Secrets."
-        )
-    url = str(url).strip()
-    if url.startswith("postgres://"):
-        url = "postgresql://" + url[len("postgres://"):]
-    if "sslmode=" not in url:
-        separator = "&" if "?" in url else "?"
-        url = f"{url}{separator}sslmode=require"
-    return url
-
-
-def db_connect():
-    return psycopg2.connect(normalize_database_url(DATABASE_URL))
-
-
-@st.cache_resource(show_spinner=False)
-def setup_cloud_database():
-    """Create the Supabase/Postgres readings table and indexes if needed."""
-    with db_connect() as conn:
-        with conn.cursor() as cur:
-            cur.execute("""
-            CREATE TABLE IF NOT EXISTS readings (
-                id BIGSERIAL PRIMARY KEY,
-                observed_at TIMESTAMPTZ NOT NULL,
-                sensor_id TEXT NOT NULL,
-                sensor_name TEXT NOT NULL,
-                temperature_c DOUBLE PRECISION,
-                humidity DOUBLE PRECISION,
-                barometric_pressure_inhg DOUBLE PRECISION,
-                voltage DOUBLE PRECISION,
-                source TEXT DEFAULT 'sensorpush_api',
-                stored_at TIMESTAMPTZ DEFAULT NOW(),
-                UNIQUE (sensor_id, observed_at)
-            )
-            """)
-            cur.execute("CREATE INDEX IF NOT EXISTS idx_readings_observed_at ON readings (observed_at)")
-            cur.execute("CREATE INDEX IF NOT EXISTS idx_readings_sensor_observed ON readings (sensor_id, observed_at)")
-        conn.commit()
-    return True
 
 
 def get_access_token():
@@ -931,10 +872,21 @@ def get_samples(access_token, limit):
     return response.json()
 
 
-def samples_to_rows(sensors, samples):
+@st.cache_data(ttl=55, show_spinner=False)
+def load_data():
+    """Fetch recent SensorPush readings directly from the SensorPush API.
+
+    This cloud version does not use config.py, collector.py, or sensorpush.db.
+    Credentials must be stored in Streamlit Cloud Secrets.
+    """
+    access_token = get_access_token()
+    sensors = get_sensors(access_token)
+    samples = get_samples(access_token, SENSORPUSH_SAMPLE_LIMIT)
+
     rows = []
     for sensor_id, readings in samples.get("sensors", {}).items():
         sensor_name = sensors.get(sensor_id, {}).get("name", sensor_id)
+
         for reading in readings or []:
             observed_time = reading.get("observed")
             temperature_f = reading.get("temperature")
@@ -945,207 +897,31 @@ def samples_to_rows(sensors, samples):
             if observed_time is None or temperature_f is None or humidity is None:
                 continue
 
-            rows.append((
-                observed_time,
-                sensor_id,
-                sensor_name,
-                fahrenheit_to_celsius(float(temperature_f)),
-                float(humidity) if humidity is not None else None,
-                float(pressure) if pressure is not None else None,
-                float(voltage) if voltage is not None else None,
-                "sensorpush_api_cloud",
-            ))
-    return rows
+            rows.append({
+                "timestamp": observed_time,
+                "sensor_id": sensor_id,
+                "sensor_name": sensor_name,
+                "temperature_c": fahrenheit_to_celsius(float(temperature_f)),
+                "humidity": float(humidity) if humidity is not None else None,
+                "barometric_pressure_inhg": float(pressure) if pressure is not None else None,
+                "voltage": float(voltage) if voltage is not None else None,
+                "source": "sensorpush_api_cloud",
+            })
 
-
-def insert_rows(rows):
-    if not rows:
-        return 0
-    setup_cloud_database()
-    with db_connect() as conn:
-        with conn.cursor() as cur:
-            psycopg2.extras.execute_values(
-                cur,
-                """
-                INSERT INTO readings (
-                    observed_at, sensor_id, sensor_name,
-                    temperature_c, humidity, barometric_pressure_inhg,
-                    voltage, source
-                ) VALUES %s
-                ON CONFLICT (sensor_id, observed_at) DO UPDATE SET
-                    sensor_name = EXCLUDED.sensor_name,
-                    temperature_c = EXCLUDED.temperature_c,
-                    humidity = EXCLUDED.humidity,
-                    barometric_pressure_inhg = EXCLUDED.barometric_pressure_inhg,
-                    voltage = EXCLUDED.voltage,
-                    source = EXCLUDED.source
-                """,
-                rows,
-                page_size=1000,
-            )
-            inserted_or_updated = cur.rowcount
-        conn.commit()
-    return inserted_or_updated
-
-
-@st.cache_data(ttl=55, show_spinner=False)
-def sync_latest_to_database():
-    """Fetch only recent SensorPush samples, then store new rows in Supabase.
-
-    This is the key difference from the direct cloud version: the app does NOT ask
-    SensorPush for all historical data every refresh. Historical graph data comes
-    from Supabase.
-    """
-    setup_cloud_database()
-    access_token = get_access_token()
-    sensors = get_sensors(access_token)
-    samples = get_samples(access_token, SENSORPUSH_POLL_LIMIT)
-    rows = samples_to_rows(sensors, samples)
-    changed = insert_rows(rows)
-    return {"returned": len(rows), "inserted_or_updated": changed}
-
-
-def timedelta_for_range(range_label):
-    if range_label == "H":
-        return pd.Timedelta(hours=1)
-    if range_label == "D":
-        return pd.Timedelta(days=1)
-    if range_label == "W":
-        return pd.Timedelta(days=7)
-    if range_label == "M":
-        return pd.Timedelta(days=30)
-    if range_label == "Y":
-        return pd.Timedelta(days=365)
-    return pd.Timedelta(days=1)
-
-
-def prepare_dataframe(rows):
     df = pd.DataFrame(rows)
     if df.empty:
         return df
+
     df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
     df = df.dropna(subset=["timestamp"])
     if df.empty:
         return df
+
     df["timestamp"] = df["timestamp"].dt.tz_convert(LOCAL_TIMEZONE)
     df["timestamp_display"] = df["timestamp"].dt.strftime("%m/%d %I:%M %p")
     df["pressure_mb"] = df["barometric_pressure_inhg"] * 33.8639
+
     return df.sort_values("timestamp").reset_index(drop=True)
-
-
-@st.cache_data(ttl=55, show_spinner=False)
-@st.cache_data(ttl=55, show_spinner=False)
-def load_data(range_label="D"):
-    """Load the selected range from Supabase, downsampled in SQL.
-
-    Supabase still stores every raw reading. For the browser chart, we query
-    bucketed averages for large windows so Streamlit/Altair never has to load
-    tens of thousands of points. The latest row per sensor is always included
-    for the status cards.
-    """
-    setup_cloud_database()
-
-    bucket_by_range = {
-        "H": None,
-        "D": "2 minutes",
-        "W": "15 minutes",
-        "M": "1 hour",
-        "Y": "6 hours",
-    }
-    bucket = bucket_by_range.get(range_label, "2 minutes")
-
-    with db_connect() as conn:
-        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-            cur.execute("SELECT MAX(observed_at) AS max_time FROM readings")
-            max_row = cur.fetchone()
-            max_time = max_row["max_time"] if max_row else None
-
-            if max_time is None:
-                return pd.DataFrame()
-
-            start_time = max_time - timedelta_for_range(range_label)
-
-            if bucket is None:
-                cur.execute(
-                    """
-                    WITH latest AS (
-                        SELECT DISTINCT ON (sensor_id)
-                            observed_at AS timestamp,
-                            sensor_id,
-                            sensor_name,
-                            temperature_c,
-                            humidity,
-                            barometric_pressure_inhg,
-                            voltage,
-                            source
-                        FROM readings
-                        ORDER BY sensor_id, observed_at DESC
-                    ),
-                    range_rows AS (
-                        SELECT
-                            observed_at AS timestamp,
-                            sensor_id,
-                            sensor_name,
-                            temperature_c,
-                            humidity,
-                            barometric_pressure_inhg,
-                            voltage,
-                            source
-                        FROM readings
-                        WHERE observed_at >= %s AND observed_at <= %s
-                    )
-                    SELECT DISTINCT * FROM (
-                        SELECT * FROM range_rows
-                        UNION ALL
-                        SELECT * FROM latest
-                    ) AS combined
-                    ORDER BY timestamp
-                    """,
-                    (start_time, max_time),
-                )
-            else:
-                cur.execute(
-                    """
-                    WITH latest AS (
-                        SELECT DISTINCT ON (sensor_id)
-                            observed_at AS timestamp,
-                            sensor_id,
-                            sensor_name,
-                            temperature_c,
-                            humidity,
-                            barometric_pressure_inhg,
-                            voltage,
-                            source
-                        FROM readings
-                        ORDER BY sensor_id, observed_at DESC
-                    ),
-                    range_rows AS (
-                        SELECT
-                            date_bin(%s::interval, observed_at, TIMESTAMPTZ '1970-01-01') AS timestamp,
-                            sensor_id,
-                            MAX(sensor_name) AS sensor_name,
-                            AVG(temperature_c) AS temperature_c,
-                            AVG(humidity) AS humidity,
-                            AVG(barometric_pressure_inhg) AS barometric_pressure_inhg,
-                            AVG(voltage) AS voltage,
-                            MAX(source) AS source
-                        FROM readings
-                        WHERE observed_at >= %s AND observed_at <= %s
-                        GROUP BY sensor_id, date_bin(%s::interval, observed_at, TIMESTAMPTZ '1970-01-01')
-                    )
-                    SELECT DISTINCT * FROM (
-                        SELECT * FROM range_rows
-                        UNION ALL
-                        SELECT * FROM latest
-                    ) AS combined
-                    ORDER BY timestamp
-                    """,
-                    (bucket, start_time, max_time, bucket),
-                )
-
-            rows = cur.fetchall()
-
-    return prepare_dataframe(rows)
 
 def is_normal(temp, humidity):
     return (TEMP_MIN <= temp <= TEMP_MAX) and (HUMIDITY_MIN <= humidity <= HUMIDITY_MAX)
@@ -1404,78 +1180,6 @@ def graph_axis_format(range_label):
         return "%m/%d", 6
     return "%b %Y", 6
 
-def downsample_for_plot(view, range_label):
-    """Reduce only the number of points sent to Altair/Vega.
-
-    Supabase still stores all raw historical readings. This function only thins the
-    dataframe used for browser plotting/hover so W/M/Y do not try to render tens of
-    thousands of points. H and D stay high-resolution.
-    """
-    if view.empty:
-        return view
-
-    # H/D are small enough to keep detailed. Larger windows are averaged by time.
-    freq_by_range = {
-        "H": None,
-        "D": None,
-        "W": "10min",
-        "M": "30min",
-        "Y": "6h",
-    }
-    freq = freq_by_range.get(range_label)
-
-    # Safety cap even for H/D, in case the database becomes denser later.
-    max_points_per_sensor = {
-        "H": 900,
-        "D": 1200,
-        "W": 1000,
-        "M": 1000,
-        "Y": 800,
-    }.get(range_label, 1000)
-
-    parts = []
-    numeric_cols = [c for c in view.columns if c not in {
-        "timestamp", "timestamp_display", "sensor_id", "sensor_name", "source",
-        "_hover_label", "_hover_anchor"
-    } and pd.api.types.is_numeric_dtype(view[c])]
-
-    for sensor_name, g in view.sort_values("timestamp").groupby("sensor_name", sort=False):
-        g = g.dropna(subset=["timestamp"]).copy()
-        if g.empty:
-            continue
-
-        if freq is not None:
-            resampled = (
-                g.set_index("timestamp")[numeric_cols]
-                .resample(freq)
-                .mean()
-                .dropna(how="all")
-                .reset_index()
-            )
-            resampled["sensor_name"] = sensor_name
-            if "sensor_id" in g.columns:
-                resampled["sensor_id"] = g["sensor_id"].iloc[0]
-            if "source" in g.columns:
-                resampled["source"] = g["source"].iloc[0]
-            g = resampled
-
-        # Hard cap by evenly selecting rows, preserving first/last.
-        if len(g) > max_points_per_sensor:
-            import numpy as np
-            idx = np.linspace(0, len(g) - 1, max_points_per_sensor).round().astype(int)
-            idx = sorted(set(idx))
-            g = g.iloc[idx].copy()
-
-        parts.append(g)
-
-    if not parts:
-        return view.iloc[0:0].copy()
-
-    out = pd.concat(parts, ignore_index=True).sort_values("timestamp")
-    out["timestamp_display"] = out["timestamp"].dt.strftime("%m/%d %I:%M %p")
-    return out.reset_index(drop=True)
-
-
 def make_sensorpush_chart(view, metric_col, title, unit_suffix="", height=160, range_label="D", x_start=None, x_end=None, capture_param=None, union_filter=None, show_x_axis=True, y_domain_override=None, label_metric_col=None, display_title=True):
     if view.empty:
         return None
@@ -1495,19 +1199,6 @@ def make_sensorpush_chart(view, metric_col, title, unit_suffix="", height=160, r
     else:
         value_text = view[label_metric_col].map(lambda v: f"{v:.1f}{unit_suffix}")
     view["_hover_label"] = time_text + ", " + value_text
-
-    # Send a much smaller dataframe to Altair for plotting and hover. The full
-    # dataframe is still used above/below for scale and mean calculations.
-    plot_view = downsample_for_plot(view, range_label)
-    if not plot_view.empty:
-        plot_time_text = plot_view["timestamp"].dt.strftime("%m/%d %I:%M %p").str.replace(" 0", " ", regex=False).str.lower()
-        if unit_suffix == "in":
-            plot_value_text = plot_view[label_metric_col].map(lambda v: f"{v:.2f}{unit_suffix}")
-        else:
-            plot_value_text = plot_view[label_metric_col].map(lambda v: f"{v:.1f}{unit_suffix}")
-        plot_view["_hover_label"] = plot_time_text + ", " + plot_value_text
-    else:
-        plot_view = view
 
     # Fixed chart height, dynamic y-scale from the currently visible data.
     # The plotted data should use almost the full gray graph area while still leaving
@@ -1581,7 +1272,7 @@ def make_sensorpush_chart(view, metric_col, title, unit_suffix="", height=160, r
         y2="y2:Q",
     )
 
-    line = alt.Chart(plot_view).mark_line(strokeWidth=1.8, clip=True).encode(
+    line = alt.Chart(view).mark_line(strokeWidth=1.8, clip=True).encode(
         x=alt.X("timestamp:T", title=None, scale=x_scale, axis=x_axis),
         y=alt.Y(f"{metric_col}:Q", title=None, scale=y_scale, axis=y_axis_hidden),
         color=alt.Color("sensor_name:N", title=None, scale=color_scale, legend=None),
@@ -1640,7 +1331,7 @@ def make_sensorpush_chart(view, metric_col, title, unit_suffix="", height=160, r
         if len(hover_index) == 0:
             hover_index = pd.DatetimeIndex(sorted(view["timestamp"].dropna().unique()))
     else:
-        hover_index = pd.DatetimeIndex(sorted(plot_view["timestamp"].dropna().unique()))
+        hover_index = pd.DatetimeIndex(sorted(view["timestamp"].dropna().unique()))
 
     anchor_times = pd.DataFrame({"_hover_anchor": hover_index})
 
@@ -1649,7 +1340,7 @@ def make_sensorpush_chart(view, metric_col, title, unit_suffix="", height=160, r
     if label_metric_col != metric_col:
         numeric_cols.append(label_metric_col)
 
-    for sensor_name, sensor_rows in plot_view.sort_values("timestamp").groupby("sensor_name", sort=False):
+    for sensor_name, sensor_rows in view.sort_values("timestamp").groupby("sensor_name", sort=False):
         sensor_numeric = (
             sensor_rows.set_index("timestamp")[numeric_cols]
             .groupby(level=0).mean()
@@ -1670,7 +1361,7 @@ def make_sensorpush_chart(view, metric_col, title, unit_suffix="", height=160, r
         interpolated["_hover_anchor"] = interpolated.index
         hover_parts.append(interpolated.reset_index(drop=True))
 
-    hover_view = pd.concat(hover_parts, ignore_index=True) if hover_parts else plot_view.copy()
+    hover_view = pd.concat(hover_parts, ignore_index=True) if hover_parts else view.copy()
     hover_view = hover_view.dropna(subset=[metric_col, "sensor_name", "_hover_anchor"])
 
     anchor_time_text = hover_view["_hover_anchor"].dt.strftime("%m/%d %I:%M %p").str.replace(" 0", " ", regex=False).str.lower()
@@ -1740,7 +1431,7 @@ def make_sensorpush_chart(view, metric_col, title, unit_suffix="", height=160, r
         bg_right, text_right, bg_left, text_left
     ).properties(
         height=height,
-        width=1100,
+        width="container",
     )
 
     if display_title:
@@ -1760,15 +1451,14 @@ def make_sensorpush_chart(view, metric_col, title, unit_suffix="", height=160, r
 
 
 def hover_freq_for_range(range_label):
-    # Coarser hover anchors greatly reduce browser-side Vega work.
     if range_label == "H":
-        return "30s"
+        return "15s"
     if range_label == "D":
-        return "5min"
+        return "2min"
     if range_label == "W":
-        return "30min"
+        return "20min"
     if range_label == "M":
-        return "3h"
+        return "2h"
     return "1D"
 
 
@@ -1856,7 +1546,7 @@ def make_title_hover_band(title, range_label="D", x_start=None, x_end=None, capt
     return alt.layer(title_mark, hover_rects).properties(height=band_height, width="container")
 
 try:
-    df = load_data(st.session_state.get("graph_range", "D"))
+    df = load_data()
 except Exception as e:
     st.error("Could not load SensorPush data.")
     st.exception(e)
@@ -1949,38 +1639,7 @@ if st.session_state["show_settings"]:
     render_settings_panel()
     st.stop()
 
-# STATUS / GRAPH navigation. Use buttons instead of st.radio because Streamlit
-# Cloud can keep stale radio widget state during redeploys.
-nav_status_col, nav_graph_col, nav_spacer_col = st.columns([0.07, 0.07, 0.86], vertical_alignment="center")
-with nav_status_col:
-    if st.button("• STATUS", key="nav_status_btn"):
-        st.session_state["current_tab"] = "STATUS"
-        st.rerun()
-with nav_graph_col:
-    if st.button("• GRAPH", key="nav_graph_btn"):
-        st.session_state["current_tab"] = "GRAPH"
-        st.rerun()
-
-_tab = st.session_state.get("current_tab", "STATUS")
-_active_color = "#52b83f"
-st.markdown(
-    f"""
-    <style>
-    .st-key-nav_status_btn button, .st-key-nav_graph_btn button {{
-        background:transparent !important; border:0 !important; box-shadow:none !important;
-        padding:0 !important; min-height:26px !important; height:26px !important;
-        color:#060b3f !important; font-weight:800 !important; font-size:12px !important;
-    }}
-    .st-key-nav_status_btn button p, .st-key-nav_graph_btn button p {{
-        font-size:12px !important; font-weight:800 !important; margin:0 !important;
-    }}
-    {'.st-key-nav_status_btn button, .st-key-nav_status_btn button p { color:' + _active_color + ' !important; }' if _tab == 'STATUS' else ''}
-    {'.st-key-nav_graph_btn button, .st-key-nav_graph_btn button p { color:' + _active_color + ' !important; }' if _tab == 'GRAPH' else ''}
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
-tab = _tab
+tab = st.radio("nav", ["STATUS", "GRAPH"], horizontal=True, label_visibility="collapsed", key="main_nav")
 st.markdown('<div class="header-divider" style="margin-top:0px;margin-bottom:0px;"></div>', unsafe_allow_html=True)
 
 # ===========================================================================
@@ -2036,7 +1695,7 @@ if tab == "STATUS":
 # ===========================================================================
 else:
     if st_autorefresh is not None:
-        st_autorefresh(interval=5 * 60 * 1000, key="sensorpush_graph_refresh")
+        st_autorefresh(interval=60 * 1000, key="sensorpush_graph_refresh")
 
     latest = df.groupby("sensor_name").tail(1).sort_values("sensor_name")
     sensor_options = sorted(df["sensor_name"].unique().tolist())
@@ -2190,7 +1849,7 @@ else:
                     name=f"sp_hover_{i}", nearest=True, on="pointerover",
                     fields=["_hover_anchor"], empty=False, clear="pointerout",
                 )
-                for i in range(3)
+                for i in range(6)
             ]
             union_filter = " || ".join(
                 f'((length(data("{p.name}_store")) > 0) && '
@@ -2199,18 +1858,21 @@ else:
             )
 
             # Fixed chart height, dynamic y-scale from the currently visible sensors.
-            # The charts are downsampled internally for plotting, while the database keeps
-            # all raw historical rows. Removing the separate invisible title-hover bands
-            # also cuts a large amount of browser-side work.
-            temp_chart = make_sensorpush_chart(temp_view, "temperature_display", "TEMPERATURE", temp_suffix, height=155, range_label=range_label, x_start=graph_start, x_end=graph_end, capture_param=hover_params[0], union_filter=union_filter, show_x_axis=False, display_title=True)
-            humidity_chart = make_sensorpush_chart(view, "humidity", "RELATIVE HUMIDITY", "%", height=155, range_label=range_label, x_start=graph_start, x_end=graph_end, capture_param=hover_params[1], union_filter=union_filter, show_x_axis=False, display_title=True)
-            pressure_chart = make_sensorpush_chart(pressure_view, "pressure_display_plot", "BAROMETRIC PRESSURE", pressure_suffix, height=155, range_label=range_label, x_start=graph_start, x_end=graph_end, capture_param=hover_params[2], union_filter=union_filter, show_x_axis=True, label_metric_col="pressure_display", display_title=True)
+            # This keeps the gray graph boxes the same size while letting the actual lines
+            # expand vertically instead of looking flat.
+            temp_title = make_title_hover_band("TEMPERATURE", range_label=range_label, x_start=graph_start, x_end=graph_end, capture_param=hover_params[3], band_height=28)
+            humidity_title = make_title_hover_band("RELATIVE HUMIDITY", range_label=range_label, x_start=graph_start, x_end=graph_end, capture_param=hover_params[4], band_height=28)
+            pressure_title = make_title_hover_band("BAROMETRIC PRESSURE", range_label=range_label, x_start=graph_start, x_end=graph_end, capture_param=hover_params[5], band_height=28)
+
+            temp_chart = make_sensorpush_chart(temp_view, "temperature_display", "TEMPERATURE", temp_suffix, height=155, range_label=range_label, x_start=graph_start, x_end=graph_end, capture_param=hover_params[0], union_filter=union_filter, show_x_axis=False, display_title=False)
+            humidity_chart = make_sensorpush_chart(view, "humidity", "RELATIVE HUMIDITY", "%", height=155, range_label=range_label, x_start=graph_start, x_end=graph_end, capture_param=hover_params[1], union_filter=union_filter, show_x_axis=False, display_title=False)
+            pressure_chart = make_sensorpush_chart(pressure_view, "pressure_display_plot", "BAROMETRIC PRESSURE", pressure_suffix, height=155, range_label=range_label, x_start=graph_start, x_end=graph_end, capture_param=hover_params[2], union_filter=union_filter, show_x_axis=True, label_metric_col="pressure_display", display_title=False)
 
             combined_chart = alt.vconcat(
-                temp_chart,
-                humidity_chart,
-                pressure_chart,
-                spacing=22,
+                temp_title, temp_chart,
+                humidity_title, humidity_chart,
+                pressure_title, pressure_chart,
+                spacing=0,
             ).resolve_scale(x="shared", color="shared").properties(
                 # The mean-label gutter is handled by the x-scale domain inside
                 # make_sensorpush_chart; keep outer padding small to avoid shifting
@@ -2220,4 +1882,4 @@ else:
                 autosize={"type": "fit-x", "contains": "padding"},
             ).configure_view(strokeWidth=0).configure_mark(tooltip=None)
 
-            st.altair_chart(combined_chart, use_container_width=False)
+            st.altair_chart(combined_chart, use_container_width=True)

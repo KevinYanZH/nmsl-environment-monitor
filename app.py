@@ -1,5 +1,6 @@
 import os
 import re
+from datetime import timedelta
 
 import requests
 import psycopg
@@ -1002,16 +1003,16 @@ def sync_latest_to_database():
 
 def timedelta_for_range(range_label):
     if range_label == "H":
-        return pd.Timedelta(hours=1)
+        return timedelta(hours=1)
     if range_label == "D":
-        return pd.Timedelta(days=1)
+        return timedelta(days=1)
     if range_label == "W":
-        return pd.Timedelta(days=7)
+        return timedelta(days=7)
     if range_label == "M":
-        return pd.Timedelta(days=30)
+        return timedelta(days=30)
     if range_label == "Y":
-        return pd.Timedelta(days=365)
-    return pd.Timedelta(days=1)
+        return timedelta(days=365)
+    return timedelta(days=1)
 
 
 def bucket_seconds_for_range(range_label):
@@ -1350,17 +1351,17 @@ def graph_window_bounds(max_timestamp, range_label, min_timestamp=None):
     end = max_timestamp
 
     if range_label == "H":
-        start = end - pd.Timedelta(hours=1)
+        start = end - timedelta(hours=1)
     elif range_label == "D":
-        start = end - pd.Timedelta(days=1)
+        start = end - timedelta(days=1)
     elif range_label == "W":
-        start = end - pd.Timedelta(days=7)
+        start = end - timedelta(days=7)
     elif range_label == "M":
-        start = end - pd.Timedelta(days=30)
+        start = end - timedelta(days=30)
     elif range_label == "Y":
-        start = end - pd.Timedelta(days=365)
+        start = end - timedelta(days=365)
     else:
-        start = end - pd.Timedelta(days=1)
+        start = end - timedelta(days=1)
 
     return start, end
 
@@ -1762,7 +1763,7 @@ def make_title_hover_band(title, range_label="D", x_start=None, x_end=None, capt
     else:
         now = pd.Timestamp.now()
         x_start = now
-        x_end = now + pd.Timedelta(minutes=1)
+        x_end = now + timedelta(minutes=1)
         gutter_start = now
         x_scale = alt.Scale()
         hover_index = pd.DatetimeIndex([x_start, x_end])

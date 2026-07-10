@@ -1078,9 +1078,22 @@ def load_data(range_label="D"):
                     FROM readings
                     ORDER BY sensor_id, observed_at DESC
                 ),
+                bucketed AS (
+                    SELECT
+                        floor(extract(epoch from observed_at) / %s) * %s AS bucket_epoch,
+                        sensor_id,
+                        sensor_name,
+                        temperature_c,
+                        humidity,
+                        barometric_pressure_inhg,
+                        voltage,
+                        source
+                    FROM readings
+                    WHERE observed_at >= %s AND observed_at <= %s
+                ),
                 range_rows AS (
                     SELECT
-                        to_timestamp(floor(extract(epoch from observed_at) / %s) * %s) AS timestamp,
+                        to_timestamp(bucket_epoch) AS timestamp,
                         sensor_id,
                         max(sensor_name) AS sensor_name,
                         avg(temperature_c) AS temperature_c,
@@ -1088,9 +1101,8 @@ def load_data(range_label="D"):
                         avg(barometric_pressure_inhg) AS barometric_pressure_inhg,
                         avg(voltage) AS voltage,
                         max(source) AS source
-                    FROM readings
-                    WHERE observed_at >= %s AND observed_at <= %s
-                    GROUP BY sensor_id, floor(extract(epoch from observed_at) / %s)
+                    FROM bucketed
+                    GROUP BY sensor_id, bucket_epoch
                 )
                 SELECT DISTINCT * FROM (
                     SELECT * FROM range_rows
@@ -1099,7 +1111,7 @@ def load_data(range_label="D"):
                 ) AS combined
                 ORDER BY timestamp
                 """,
-                (bucket_seconds_for_range(range_label), bucket_seconds_for_range(range_label), start_time, max_time, bucket_seconds_for_range(range_label)),
+                (bucket_seconds_for_range(range_label), bucket_seconds_for_range(range_label), start_time, max_time),
             )
             rows = cur.fetchall()
 

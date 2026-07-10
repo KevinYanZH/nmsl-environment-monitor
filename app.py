@@ -9,6 +9,9 @@ import pandas as pd
 import streamlit as st
 import altair as alt
 
+# Avoid Streamlit/Altair crashing when a range temporarily has many rows.
+alt.data_transformers.disable_max_rows()
+
 try:
     from streamlit_autorefresh import st_autorefresh
 except ImportError:
@@ -1024,13 +1027,23 @@ def prepare_dataframe(rows):
 
 @st.cache_data(ttl=55, show_spinner=False)
 def load_data(range_label="D"):
-    """Load only the selected range from Supabase plus the latest row per sensor.
+    """Load the selected range from Supabase with SQL-side aggregation.
 
-    The background GitHub Actions collector now writes new readings into Supabase,
-    so the dashboard only reads the database. This keeps page loads fast and
-    avoids asking SensorPush directly every time someone opens or refreshes the app.
+    Important: Supabase still stores every raw reading. This function only reduces
+    the number of rows sent to Streamlit/Altair for display so D/W/M/Y do not crash
+    or become very slow in the browser.
     """
     setup_cloud_database()
+
+    # Keep H close to raw, but aggregate longer windows before they reach Streamlit.
+    bucket_by_range = {
+        "H": "30 seconds",
+        "D": "2 minutes",
+        "W": "15 minutes",
+        "M": "1 hour",
+        "Y": "6 hours",
+    }
+    bucket = bucket_by_range.get(range_label, "2 minutes")
 
     with db_connect() as conn:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
@@ -1042,6 +1055,7 @@ def load_data(range_label="D"):
                 return pd.DataFrame()
 
             start_time = max_time - timedelta_for_range(range_label)
+
             cur.execute(
                 """
                 WITH latest AS (
@@ -1055,29 +1069,33 @@ def load_data(range_label="D"):
                         voltage,
                         source
                     FROM readings
+                    WHERE observed_at IS NOT NULL
                     ORDER BY sensor_id, observed_at DESC
                 ),
-                range_rows AS (
+                bucketed AS (
                     SELECT
-                        observed_at AS timestamp,
+                        date_bin(%s::interval, observed_at, '2000-01-01 00:00:00+00'::timestamptz) AS timestamp,
                         sensor_id,
-                        sensor_name,
-                        temperature_c,
-                        humidity,
-                        barometric_pressure_inhg,
-                        voltage,
-                        source
+                        max(sensor_name) AS sensor_name,
+                        avg(temperature_c) AS temperature_c,
+                        avg(humidity) AS humidity,
+                        avg(barometric_pressure_inhg) AS barometric_pressure_inhg,
+                        avg(voltage) AS voltage,
+                        max(source) AS source
                     FROM readings
-                    WHERE observed_at >= %s AND observed_at <= %s
+                    WHERE observed_at >= %s
+                      AND observed_at <= %s
+                      AND observed_at IS NOT NULL
+                    GROUP BY sensor_id, date_bin(%s::interval, observed_at, '2000-01-01 00:00:00+00'::timestamptz)
                 )
                 SELECT DISTINCT * FROM (
-                    SELECT * FROM range_rows
+                    SELECT * FROM bucketed
                     UNION ALL
                     SELECT * FROM latest
                 ) AS combined
                 ORDER BY timestamp
                 """,
-                (start_time, max_time),
+                (bucket, start_time, max_time, bucket),
             )
             rows = cur.fetchall()
 

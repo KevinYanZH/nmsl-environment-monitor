@@ -1861,7 +1861,7 @@ def render_settings_panel():
 
         st.markdown('<div class="settings-divider"></div>', unsafe_allow_html=True)
 
-        with st.container(key="settings_temp_row"):
+        with st.container():
             row1_label, row1_control = st.columns([4, 1.15], vertical_alignment="center")
             with row1_label:
                 st.markdown('<div class="settings-row-label">Temperature unit</div>', unsafe_allow_html=True)
@@ -1880,7 +1880,7 @@ def render_settings_panel():
 
         st.markdown('<div class="settings-divider"></div>', unsafe_allow_html=True)
 
-        with st.container(key="settings_pressure_row"):
+        with st.container():
             row2_label, row2_control = st.columns([4, 1.15], vertical_alignment="center")
             with row2_label:
                 st.markdown('<div class="settings-row-label">Barometric pressure unit</div>', unsafe_allow_html=True)
@@ -1992,7 +1992,7 @@ else:
             safe = safe_key(name)
             is_on = st.session_state.get(f"graph_show_{name}", True)
 
-            with st.container(key=f"graph_card_wrap_{safe}"):
+            with st.container():
                 head_cols = st.columns([0.76, 0.24], vertical_alignment="center")
                 with head_cols[0]:
                     st.markdown(render_graph_sensor_header(row), unsafe_allow_html=True)

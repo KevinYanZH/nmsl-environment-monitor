@@ -3,8 +3,7 @@ import sys
 from datetime import datetime, timezone
 
 import requests
-import psycopg2
-import psycopg2.extras
+import psycopg
 
 BASE_URL = "https://api.sensorpush.com/api/v1"
 
@@ -27,7 +26,7 @@ def normalize_database_url(url: str) -> str:
 
 
 def db_connect():
-    return psycopg2.connect(normalize_database_url(DATABASE_URL))
+    return psycopg.connect(normalize_database_url(DATABASE_URL))
 
 
 def setup_database():
@@ -142,14 +141,13 @@ def insert_rows(rows):
         return 0
     with db_connect() as conn:
         with conn.cursor() as cur:
-            psycopg2.extras.execute_values(
-                cur,
+            cur.executemany(
                 """
                 INSERT INTO readings (
                     sensor_id, sensor_name, observed_at, timestamp,
                     temperature_c, humidity, barometric_pressure_inhg,
                     pressure_mb, voltage, source
-                ) VALUES %s
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 ON CONFLICT (sensor_id, observed_at) WHERE observed_at IS NOT NULL
                 DO UPDATE SET
                     sensor_name = EXCLUDED.sensor_name,
@@ -163,7 +161,6 @@ def insert_rows(rows):
                     stored_at = NOW()
                 """,
                 rows,
-                page_size=1000,
             )
             changed = cur.rowcount
         conn.commit()

@@ -722,6 +722,17 @@ if "show_settings" not in st.session_state:
 if "graph_range" not in st.session_state:
     st.session_state["graph_range"] = "D"
 
+# Defensive defaults for widgets. Streamlit Cloud can keep browser widget state
+# across hot-reloads; these defaults prevent missing-key crashes after redeploys.
+for _key, _default in {
+    "current_tab": "STATUS",
+    "gw_filter": "",
+    "sensor_filter": "",
+    "graph_sensor_filter": "",
+}.items():
+    if _key not in st.session_state:
+        st.session_state[_key] = _default
+
 if st.session_state["theme"] == "dark":
     st.markdown(
         """
@@ -1023,14 +1034,25 @@ def prepare_dataframe(rows):
 
 
 @st.cache_data(ttl=55, show_spinner=False)
+@st.cache_data(ttl=55, show_spinner=False)
 def load_data(range_label="D"):
-    """Load only the selected range from Supabase plus the latest row per sensor.
+    """Load the selected range from Supabase, downsampled in SQL.
 
-    The background GitHub Actions collector now writes new readings into Supabase,
-    so the dashboard only reads the database. This keeps page loads fast and
-    avoids asking SensorPush directly every time someone opens or refreshes the app.
+    Supabase still stores every raw reading. For the browser chart, we query
+    bucketed averages for large windows so Streamlit/Altair never has to load
+    tens of thousands of points. The latest row per sensor is always included
+    for the status cards.
     """
     setup_cloud_database()
+
+    bucket_by_range = {
+        "H": None,
+        "D": "2 minutes",
+        "W": "15 minutes",
+        "M": "1 hour",
+        "Y": "6 hours",
+    }
+    bucket = bucket_by_range.get(range_label, "2 minutes")
 
     with db_connect() as conn:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
@@ -1042,43 +1064,85 @@ def load_data(range_label="D"):
                 return pd.DataFrame()
 
             start_time = max_time - timedelta_for_range(range_label)
-            cur.execute(
-                """
-                WITH latest AS (
-                    SELECT DISTINCT ON (sensor_id)
-                        observed_at AS timestamp,
-                        sensor_id,
-                        sensor_name,
-                        temperature_c,
-                        humidity,
-                        barometric_pressure_inhg,
-                        voltage,
-                        source
-                    FROM readings
-                    ORDER BY sensor_id, observed_at DESC
-                ),
-                range_rows AS (
-                    SELECT
-                        observed_at AS timestamp,
-                        sensor_id,
-                        sensor_name,
-                        temperature_c,
-                        humidity,
-                        barometric_pressure_inhg,
-                        voltage,
-                        source
-                    FROM readings
-                    WHERE observed_at >= %s AND observed_at <= %s
+
+            if bucket is None:
+                cur.execute(
+                    """
+                    WITH latest AS (
+                        SELECT DISTINCT ON (sensor_id)
+                            observed_at AS timestamp,
+                            sensor_id,
+                            sensor_name,
+                            temperature_c,
+                            humidity,
+                            barometric_pressure_inhg,
+                            voltage,
+                            source
+                        FROM readings
+                        ORDER BY sensor_id, observed_at DESC
+                    ),
+                    range_rows AS (
+                        SELECT
+                            observed_at AS timestamp,
+                            sensor_id,
+                            sensor_name,
+                            temperature_c,
+                            humidity,
+                            barometric_pressure_inhg,
+                            voltage,
+                            source
+                        FROM readings
+                        WHERE observed_at >= %s AND observed_at <= %s
+                    )
+                    SELECT DISTINCT * FROM (
+                        SELECT * FROM range_rows
+                        UNION ALL
+                        SELECT * FROM latest
+                    ) AS combined
+                    ORDER BY timestamp
+                    """,
+                    (start_time, max_time),
                 )
-                SELECT DISTINCT * FROM (
-                    SELECT * FROM range_rows
-                    UNION ALL
-                    SELECT * FROM latest
-                ) AS combined
-                ORDER BY timestamp
-                """,
-                (start_time, max_time),
-            )
+            else:
+                cur.execute(
+                    """
+                    WITH latest AS (
+                        SELECT DISTINCT ON (sensor_id)
+                            observed_at AS timestamp,
+                            sensor_id,
+                            sensor_name,
+                            temperature_c,
+                            humidity,
+                            barometric_pressure_inhg,
+                            voltage,
+                            source
+                        FROM readings
+                        ORDER BY sensor_id, observed_at DESC
+                    ),
+                    range_rows AS (
+                        SELECT
+                            date_bin(%s::interval, observed_at, TIMESTAMPTZ '1970-01-01') AS timestamp,
+                            sensor_id,
+                            MAX(sensor_name) AS sensor_name,
+                            AVG(temperature_c) AS temperature_c,
+                            AVG(humidity) AS humidity,
+                            AVG(barometric_pressure_inhg) AS barometric_pressure_inhg,
+                            AVG(voltage) AS voltage,
+                            MAX(source) AS source
+                        FROM readings
+                        WHERE observed_at >= %s AND observed_at <= %s
+                        GROUP BY sensor_id, date_bin(%s::interval, observed_at, TIMESTAMPTZ '1970-01-01')
+                    )
+                    SELECT DISTINCT * FROM (
+                        SELECT * FROM range_rows
+                        UNION ALL
+                        SELECT * FROM latest
+                    ) AS combined
+                    ORDER BY timestamp
+                    """,
+                    (bucket, start_time, max_time, bucket),
+                )
+
             rows = cur.fetchall()
 
     return prepare_dataframe(rows)
@@ -1676,7 +1740,7 @@ def make_sensorpush_chart(view, metric_col, title, unit_suffix="", height=160, r
         bg_right, text_right, bg_left, text_left
     ).properties(
         height=height,
-        width="container",
+        width=1100,
     )
 
     if display_title:
@@ -1885,7 +1949,38 @@ if st.session_state["show_settings"]:
     render_settings_panel()
     st.stop()
 
-tab = st.radio("nav", ["STATUS", "GRAPH"], horizontal=True, label_visibility="collapsed", key="main_nav")
+# STATUS / GRAPH navigation. Use buttons instead of st.radio because Streamlit
+# Cloud can keep stale radio widget state during redeploys.
+nav_status_col, nav_graph_col, nav_spacer_col = st.columns([0.07, 0.07, 0.86], vertical_alignment="center")
+with nav_status_col:
+    if st.button("• STATUS", key="nav_status_btn"):
+        st.session_state["current_tab"] = "STATUS"
+        st.rerun()
+with nav_graph_col:
+    if st.button("• GRAPH", key="nav_graph_btn"):
+        st.session_state["current_tab"] = "GRAPH"
+        st.rerun()
+
+_tab = st.session_state.get("current_tab", "STATUS")
+_active_color = "#52b83f"
+st.markdown(
+    f"""
+    <style>
+    .st-key-nav_status_btn button, .st-key-nav_graph_btn button {{
+        background:transparent !important; border:0 !important; box-shadow:none !important;
+        padding:0 !important; min-height:26px !important; height:26px !important;
+        color:#060b3f !important; font-weight:800 !important; font-size:12px !important;
+    }}
+    .st-key-nav_status_btn button p, .st-key-nav_graph_btn button p {{
+        font-size:12px !important; font-weight:800 !important; margin:0 !important;
+    }}
+    {'.st-key-nav_status_btn button, .st-key-nav_status_btn button p { color:' + _active_color + ' !important; }' if _tab == 'STATUS' else ''}
+    {'.st-key-nav_graph_btn button, .st-key-nav_graph_btn button p { color:' + _active_color + ' !important; }' if _tab == 'GRAPH' else ''}
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+tab = _tab
 st.markdown('<div class="header-divider" style="margin-top:0px;margin-bottom:0px;"></div>', unsafe_allow_html=True)
 
 # ===========================================================================
@@ -2125,4 +2220,4 @@ else:
                 autosize={"type": "fit-x", "contains": "padding"},
             ).configure_view(strokeWidth=0).configure_mark(tooltip=None)
 
-            st.altair_chart(combined_chart, use_container_width=True)
+            st.altair_chart(combined_chart, use_container_width=False)

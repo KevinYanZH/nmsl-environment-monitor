@@ -1920,26 +1920,56 @@ if st.session_state["show_settings"]:
     render_settings_panel()
     st.stop()
 
-nav_cols = st.columns([0.08, 0.16, 12], vertical_alignment="center")
+# STATUS / GRAPH navigation. Give each button enough real width so Streamlit
+# cannot wrap the words into a vertical stack on wide or narrow screens.
+nav_cols = st.columns([0.72, 0.72, 12], vertical_alignment="center", gap="small")
 with nav_cols[0]:
-    if st.button("STATUS", key="main_nav_status_btn"):
+    if st.button("STATUS", key="main_nav_status_btn", use_container_width=True):
         st.session_state["main_nav_v2"] = "STATUS"
         st.rerun()
 with nav_cols[1]:
-    if st.button("GRAPH", key="main_nav_graph_btn"):
+    if st.button("GRAPH", key="main_nav_graph_btn", use_container_width=True):
         st.session_state["main_nav_v2"] = "GRAPH"
         st.rerun()
 tab = st.session_state.get("main_nav_v2", "STATUS")
 st.markdown(
     f"""
     <style>
-    .st-key-main_nav_status_btn button, .st-key-main_nav_graph_btn button {{
-        background: transparent !important; border: none !important; box-shadow: none !important;
-        padding: 0 !important; margin: 0 !important; min-height: 24px !important;
+    .st-key-main_nav_status_btn,
+    .st-key-main_nav_graph_btn {{
+        min-width: 76px !important;
+        width: 100% !important;
     }}
-    .st-key-main_nav_status_btn button p, .st-key-main_nav_graph_btn button p {{
-        font-size: 12px !important; font-weight: 800 !important; letter-spacing: 0.5px !important;
-        color: #060b3f !important; margin: 0 !important;
+    .st-key-main_nav_status_btn button,
+    .st-key-main_nav_graph_btn button {{
+        background: transparent !important;
+        border: none !important;
+        box-shadow: none !important;
+        padding: 0 8px !important;
+        margin: 0 !important;
+        min-height: 30px !important;
+        height: 30px !important;
+        width: 100% !important;
+        min-width: 76px !important;
+        white-space: nowrap !important;
+        overflow: visible !important;
+    }}
+    .st-key-main_nav_status_btn button p,
+    .st-key-main_nav_graph_btn button p {{
+        display: block !important;
+        width: auto !important;
+        min-width: max-content !important;
+        white-space: nowrap !important;
+        word-break: keep-all !important;
+        overflow-wrap: normal !important;
+        font-size: 12px !important;
+        line-height: 30px !important;
+        font-weight: 800 !important;
+        letter-spacing: 0.5px !important;
+        color: #060b3f !important;
+        margin: 0 !important;
+        padding: 0 !important;
+        text-align: left !important;
     }}
     .st-key-main_nav_{'status' if tab == 'STATUS' else 'graph'}_btn button p {{
         color: #52b83f !important;
